@@ -1,0 +1,296 @@
+<div id="vig"></div><div id="dmg"></div><div id="heal"></div>
+
+<div id="hud" class="hide">
+  <div id="top">
+    <div class="box panel"><div class="k">امتیاز</div><div class="v" id="tScore">0</div></div>
+    <div class="box panel"><div class="k">پیشتاز</div><div class="v lead" id="tLead">—</div></div>
+    <div class="box panel"><div class="k">هدف</div><div class="v" id="tGoal">25</div></div>
+  </div>
+
+  <div id="feed"></div>
+  <div id="floaters"></div>
+
+  <div id="vitals" class="panel">
+    <div class="lbl">سلامتی</div>
+    <div id="hpwrap"><div id="hpbar"></div><div id="hpnum">100</div></div>
+  </div>
+
+  <div id="ammo" class="panel">
+    <div id="wname">تفنگ حبابی</div>
+    <div id="acount">30<small>/90</small></div>
+    <div id="reloading"></div>
+    <div id="wslots"><div class="on">1</div><div>2</div><div>3</div></div>
+  </div>
+
+  <div id="hint"></div>
+
+  <div id="board" class="panel">
+    <h3>همه علیه همه</h3>
+    <table><thead><tr><th>بازیکن</th><th>کشتار</th><th>مرگ</th><th>سری</th></tr></thead>
+    <tbody id="boardBody"></tbody></table>
+  </div>
+</div>
+
+<div id="cross"><i class="dot"></i><i class="t" id="cU"></i><i class="t" id="cD"></i><i class="h" id="cL"></i><i class="h" id="cR"></i></div>
+<div id="hitmark"><span style="transform:rotate(45deg)"></span><span style="transform:rotate(-45deg)"></span></div>
+
+<!-- on-screen controls; only ever unhidden on a touch device -->
+<div id="touch" hidden>
+  <div id="tMove" class="tzone"></div>
+  <div id="tLook" class="tzone"></div>
+  <div id="tStick" hidden><i></i></div>
+  <div id="tWeps">
+    <button type="button" data-w="smg" aria-label="تفنگ حبابی">1</button>
+    <button type="button" data-w="shotgun" aria-label="مارشمالو">2</button>
+    <button type="button" data-w="rifle" aria-label="آبنبات چوبی">3</button>
+  </div>
+  <div id="tSys">
+    <button type="button" class="tbtn sys" id="tPause" aria-label="توقف">❚❚</button>
+    <button type="button" class="tbtn sys" id="tBoard" aria-label="جدول امتیازات">☰</button>
+  </div>
+  <button type="button" class="tbtn" id="tReload" aria-label="تعویض خشاب">⟳</button>
+  <button type="button" class="tbtn" id="tJump" aria-label="پرش">⤒</button>
+  <button type="button" class="tbtn fire" id="tFire" aria-label="شلیک">شلیک</button>
+</div>
+
+<div id="rotate" hidden>
+  <div class="panel">
+    <div class="ric">📱</div>
+    <strong>گوشی را افقی کنید</strong>
+    <p>اکشن زون برای صفحه عریض طراحی شده است؛ حالت افقی فضای کافی برای هر دو انگشت فراهم می‌کند.</p>
+    <button class="mini-btn" id="rotateOk" type="button">ادامه بده</button>
+  </div>
+</div>
+
+<div class="screen" id="title">
+  <!-- The stage the character stands on, and only ever that: `.hud` is the
+       wide title screen, so the pause card keeps the see-through wash over
+       the frozen game that tells you the game is still there. -->
+  <div class="hud-stage" aria-hidden="true">
+    <i class="hud-sky"></i><i class="hud-floor"><i class="hud-grid"></i></i>
+    <!-- The street itself. Sits over the painted sky and floor rather than
+         replacing them: those are what shows while this decodes, and what
+         its edges fade into on a window wider than it is. -->
+    <i class="hud-scene"></i><i class="hud-pool"></i>
+  </div>
+  <h1>ACTION<em>ZONE</em></h1>
+  <div class="sub">همه علیه همه</div>
+  <!-- Wrapped so the wide layout can put both counts and the gear in one
+       corner cluster. Like every wrapper added here it is `display:contents`
+       everywhere else, so the narrow column and the pause card lay these out
+       exactly as they did before it existed. -->
+  <div class="hud-meta">
+    <div class="online-count" id="onlineCount"></div>
+    <div class="online-count" id="matchesCount"></div>
+    <!-- Wide layout only. On a phone and on the pause card the two look
+         settings stay in the column, which is where they matter most: a
+         setting behind a popover on a paused game is one nobody finds. -->
+    <button class="mini-btn menu-gear" id="menuGear" type="button"
+            aria-expanded="false" aria-controls="menuSettings" aria-label="تنظیمات هدف‌گیری">⚙</button>
+  </div>
+  <div id="menu">
+    <!-- The right rail. One tile, because there is one thing behind it: the
+         mockup's FRIENDS / TEAM / CLUB have nothing to open here. -->
+    <div class="hud-rail setup-only">
+      <button class="mini-btn locker-btn rail-rooms" id="roomsOpen" type="button">
+        <span class="tile-icon" aria-hidden="true">🚪</span><span class="tile-name">اتاق‌ها</span>
+        <small class="tile-sub" id="roomsTileSub">پیدا کنید یا بسازید</small>
+      </button>
+    </div>
+    <div class="menu-settings" id="menuSettings">
+      <label class="sens" for="sensRange">
+        <span>حساسیت موس</span>
+        <input type="range" id="sensRange" min="0.4" max="2.8" step="0.05" value="1">
+        <b id="sensVal">1.00×</b>
+      </label>
+      <label class="listed look-invert" for="invertY">
+        <input type="checkbox" id="invertY">
+        <span>معکوس کردن محور Y</span>
+      </label>
+    </div>
+    <div class="mode-picker setup-only" id="modePicker" role="group" aria-labelledby="modePickerLabel">
+      <span class="mode-picker-label" id="modePickerLabel">حالت بازی</span>
+      <!-- The wide layout draws this as one card: the mode you are on, what
+           it asks of you, and a button that swaps it. The two buttons below
+           are still the control — CHANGE MODE presses the other one — so the
+           narrow column and the pause card are untouched, and a keyboard
+           still meets a pair of real toggles with aria-pressed on them. -->
+      <div class="card-row">
+      <div class="mode-card" aria-hidden="true">
+        <span class="mode-card-tag">حالت</span>
+        <i class="mode-card-art"></i>
+        <b class="mode-card-name" id="modeCardName">تیم‌مرگ</b>
+        <small class="mode-card-goal" id="modeCardGoal">۲۵ کشتار</small>
+        <small class="mode-card-blurb" id="modeCardBlurb">هرکس برای خودش؛ بیشترین کشتار برنده است.</small>
+      </div>
+      <!-- The map is a choice now, the same as the mode: a card reading the
+           live state with controls under it. The goal line carries which of
+           the two you are looking at — UP NEXT when the rotation is picking,
+           SELECTED once you have. -->
+      <div class="mode-card map-card" id="mapCard" data-map="nuketown" aria-hidden="true">
+        <span class="mode-card-tag">نقشه</span>
+        <i class="mode-card-art"></i>
+        <b class="mode-card-name" id="mapCardName">نیوک‌تاون</b>
+        <small class="mode-card-goal" id="mapCardGoal">بعدی</small>
+        <small class="mode-card-blurb" id="mapCardBlurb">دو خانه، یک خیابان و هیچ جای امنی برای پنهان شدن.</small>
+      </div>
+      </div>
+      <div class="mode-options">
+        <button class="mini-btn mode-option" id="modeDm" type="button" aria-pressed="true">
+          <span>تیم‌مرگ</span>
+          <small>۲۵ کشتار</small>
+        </button>
+        <button class="mini-btn mode-option" id="modeKc" type="button" aria-pressed="false">
+          <span>تأیید کشتار</span>
+          <small>۲۰ تأیید</small>
+        </button>
+      </div>
+      <!-- Filled from the map registry at boot rather than written out here:
+           the pool is the registry's business, and a third map should not
+           mean a third button to remember. Empty until then, and it stays
+           empty on a page whose map runtime never loaded, which is exactly
+           the page that must not offer to switch maps. -->
+      <div class="mode-options map-options" id="mapOptions" role="group" aria-label="نقشه"></div>
+      <div class="swap-row">
+        <button class="mini-btn mode-swap" id="modeSwap" type="button">تغییر حالت</button>
+        <button class="mini-btn mode-swap" id="mapSwap" type="button">تغییر نقشه</button>
+      </div>
+    </div>
+    <div class="menu-actions">
+      <button class="menu-btn setup-only" id="quickPlay">بازی آنلاین</button>
+      <button class="menu-btn" id="play">تک‌نفره</button>
+      <!-- Pause card only: the way out of a round that is still running.
+           #netLeave cannot serve here — it lives on the lobby panel, which
+           netSetPauseMenu hides for the whole match. -->
+      <button class="mini-btn pause-only" id="leaveMatch" type="button">خروج از بازی</button>
+    </div>
+    <div id="menuNote">بازی آنلاین شما را وارد یک اتاق می‌کند. در حالت تک‌نفره با هشت ربات بازی می‌کنید.</div>
+  </div>
+  <div id="lobby" class="panel" hidden>
+    <div class="lobby-head">
+      <div><small>اتاق</small><strong id="lobbyCode">······</strong></div>
+      <button class="mini-btn" id="copyRoom">کپی دعوت</button>
+    </div>
+    <div class="lobby-name-card" id="lobbyNameCard">
+      <div class="lobby-name-copy">
+        <span class="lobby-name-kicker">نام شما</span>
+        <strong>نام بازیکن را انتخاب کنید</strong>
+        <small>این نام برای دیگر بازیکنان نمایش داده می‌شود.</small>
+      </div>
+      <label class="lobby-name-field" for="playerName">
+        <span>نام بازیکن</span>
+        <input id="playerName" maxlength="20" autocomplete="nickname" spellcheck="false" value="PLAYER" placeholder="نام شما">
+        <i aria-hidden="true">✓</i>
+      </label>
+      <button class="mini-btn lobby-name-save" id="savePlayerName" type="button">ثبت نام</button>
+      <div class="lobby-name-status" id="lobbyNameStatus" role="status" aria-live="polite"></div>
+    </div>
+    <div class="roster-title"><span>بازیکنان</span><b id="rosterCount">1 / 9</b></div>
+    <ul id="roster"></ul>
+    <!-- Where the next round lands. A readout like the title screen's MAP
+         card rather than a control: the room rotates, nobody picks. Under the
+         roster because that is what it is computed from — a map everybody
+         here can build. -->
+    <div class="lobby-map"><small>نقشه</small><strong id="lobbyMap">نیوک‌تاون</strong></div>
+    <div id="lobbyCountdown" hidden>
+      <span id="countdownText"></span>
+      <button class="mini-btn" id="holdStart" type="button">مکث</button>
+    </div>
+    <div class="lobby-actions">
+      <button class="menu-btn" id="netStart">شروع بازی</button>
+      <button class="mini-btn" id="netLeave">خروج</button>
+    </div>
+  </div>
+  <div id="netStatus" role="status" aria-live="polite"></div>
+  <div class="keys">
+    <span><b>WASD</b> حرکت</span><span><b>SHIFT</b> دویدن</span><span><b>SPACE</b> پرش</span>
+    <span><b>MOUSE</b> هدف‌گیری</span><span><b>CLICK</b> شلیک</span><span><b>R</b> تعویض خشاب</span>
+    <span><b>1 2 3</b> سلاح‌ها</span><span><b>TAB</b> امتیازات</span><span><b>ESC</b> توقف</span>
+  </div>
+  <div class="keys touch-keys">
+    <span><b>انگشت چپ</b> حرکت</span><span><b>حرکت به جلو</b> دویدن</span>
+    <span><b>انگشت راست</b> هدف‌گیری</span><span><b>شلیک</b> شلیک</span>
+    <span><b>⤒</b> پرش</span><span><b>⟳</b> تعویض خشاب</span>
+    <span><b>1 2 3</b> سلاح‌ها</span><span><b>☰</b> امتیازات</span><span><b>❚❚</b> توقف</span>
+  </div>
+</div>
+
+<!-- The room browser. A .screen dialog in the store's pattern — opened from
+     the ROOMS tile, closed by CLOSE, by Escape and by the wash. It used to be
+     a list and a collapsed panel stacked in the middle of the title card,
+     where it competed with PLAY for the same glance; behind a tile it is the
+     minority path it actually is, and it gets room to be a real table.
+
+     Every id in here is the one 75-network.js already drives. The poller does
+     not care that the list moved: netRoomsPanelOpen is about the setup menu
+     being on screen, which is still exactly when this list is worth keeping
+     warm. -->
+<div class="screen" id="nameSetup" role="dialog" aria-modal="true" aria-labelledby="nameSetupTitle">
+  <div class="name-setup-card panel">
+    <span class="name-setup-kicker">اکشن زون</span>
+    <h2 id="nameSetupTitle">نام بازیکن</h2>
+    <p>یک نام برای خودت انتخاب کن؛ این نام در تمام بازی‌ها، بخش تک‌نفره و بازی‌های چندنفره استفاده می‌شود.</p>
+    <label class="name-setup-field" for="firstPlayerName">
+      <span>نام شما</span>
+      <input id="firstPlayerName" maxlength="20" autocomplete="nickname" spellcheck="false" placeholder="نام بازیکن">
+    </label>
+    <button class="menu-btn" id="confirmPlayerName" type="button">شروع بازی</button>
+    <div class="name-setup-status" id="firstPlayerNameStatus" role="status" aria-live="polite"></div>
+  </div>
+</div>
+
+<div class="screen off" id="rooms" role="dialog" aria-modal="true" aria-labelledby="roomsTitle">
+  <div class="rooms-card panel" tabindex="-1">
+    <div class="rooms-head-bar">
+      <div class="rooms-head-text">
+        <h2 id="roomsTitle">اتاق‌ها</h2>
+        <div class="rooms-sub">به یک اتاق در حال اجرا بپیوندید یا اتاق خودتان را بسازید.</div>
+      </div>
+      <div class="rooms-head-btns">
+        <button class="mini-btn" id="refreshRooms" type="button">به‌روزرسانی</button>
+        <button class="mini-btn" id="roomsClose" type="button">بستن</button>
+      </div>
+    </div>
+    <ul id="roomList"><li class="rooms-empty">در حال جست‌وجوی اتاق‌ها…</li></ul>
+    <div id="roomOptions">
+      <div class="join-row">
+        <input id="roomCode" maxlength="6" autocomplete="off" spellcheck="false" placeholder="کد اتاق" aria-label="کد اتاق">
+        <button class="mini-btn" id="joinGame">ورود</button>
+      </div>
+      <div class="opt-row">
+        <button class="mini-btn" id="hostGame">ساخت اتاق</button>
+        <label class="listed" for="roomPublic">
+          <input type="checkbox" id="roomPublic" checked>
+          <span>نمایش عمومی</span>
+        </label>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="screen off" id="dead">
+  <div class="big">از پا افتادید!</div>
+  <div class="by" id="deadBy"></div>
+  <div class="cd" id="deadCd">3</div>
+  <button class="report off" id="deadReport" type="button"><span id="deadReportLabel">گزارش هدف‌گیری</span><span class="k">F</span></button>
+</div>
+
+<div class="screen off" id="over">
+  <div class="big" id="overBig">پایان بازی</div>
+  <div class="rank" id="overRank"></div>
+  <!-- Two ways off this card, and MAIN MENU is the one that has to be here.
+       REMATCH used to be the only control on it, which left the page reload
+       as the only way back to the title — and left a guest, whose REMATCH
+       reads WAITING FOR HOST and is disabled, with nothing clickable at all.
+       showOverScreen puts the scoreboard in ahead of this row. -->
+  <div class="over-actions" id="overActions">
+    <button id="again" type="button">بازی مجدد</button>
+    <button class="mini-btn" id="overMenu" type="button">منوی اصلی</button>
+  </div>
+</div>
+
+<!-- The wordmark's home. The wide title screen is a HUD around a character
+     and has no room for a logo the size this one wants to be, so the boot
+     screen is where the game says its own name. -->
+<div id="loading"><div class="lmark">ACTION<em>ZONE</em></div><div class="lt">در حال آماده‌سازی بازی</div><div class="bar"><i id="lbar"></i></div></div>
+<div id="fatal" class="panel"></div>

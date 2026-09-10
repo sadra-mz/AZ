@@ -1,0 +1,2037 @@
+'use strict';
+
+/* Measurements of the guest experience, run as assertions.
+
+   The bounds here are deliberately loose. The point is to catch a direction
+   changing or a magnitude moving by a lot, not to pin an exact figure that
+   fails whenever a weapon is retuned. Every number in a comment is what the
+   harness actually reported when the test was written, so a future reader can
+   see how much headroom a bound has. */
+
+const test = require('node:test');
+const assert = require('node:assert');
+
+const SIM = require('./net-sim.js');
+
+const LIVE_LATENCY_MS = 96;   // measured on the production relay, commit 60ab2e6
+
+test('touch tap decisions reject drags, long holds, and cancellations', () => {
+  const match = SIM.createMatch({ latencyMs: 0, seed: 3 });
+
+  assert.strictEqual(match.host.call('touchTapShouldFire', 9.9, 250, false), true);
+  assert.strictEqual(match.host.call('touchTapShouldFire', 10, 100, false), false);
+  assert.strictEqual(match.host.call('touchTapShouldFire', 2, 251, false), false);
+  assert.strictEqual(match.host.call('touchTapShouldFire', 2, 100, true), false);
+});
+
+test('a touch tap holds fire for one tick and shoots exactly once', () => {
+  const match = SIM.createMatch({ latencyMs: 0, seed: 3 });
+  match.host.run("switchWeapon('rifle'); G.player.fireCd = 0;");
+  const ammo = match.host.get('G.player.ammo');
+  const seq = match.host.get('IN.fireSeq');
+
+  match.host.run('pulseFireForTick();');
+  assert.strictEqual(match.host.get('IN.firing'), true);
+  match.host.run(`simulate(${SIM.FIXED})`);
+
+  assert.strictEqual(match.host.get('G.player.ammo'), ammo - 1);
+  assert.strictEqual(match.host.get('IN.fireSeq'), seq + 1);
+  assert.strictEqual(match.host.get('IN.firing'), false);
+  match.host.run(`simulate(${SIM.FIXED * 30})`);
+  assert.strictEqual(match.host.get('G.player.ammo'), ammo - 1);
+});
+
+test('a tap that lands as the player dies is not spent on the respawn', () => {
+  const match = SIM.createMatch({ latencyMs: 0, seed: 3 });
+  match.host.run("switchWeapon('rifle'); G.player.fireCd = 0;");
+
+  /* The dead branch of stepPlayer returns before the pulse can be spent, so a
+     tap in the frame the player dies used to survive the whole death and fire
+     itself off on respawn -- popping the spawn shield on arrival. */
+  match.host.run('pulseFireForTick(); killActor(G.player, null);');
+  match.host.run(`simulate(${SIM.FIXED})`);
+  assert.strictEqual(match.host.get('IN.firing'), false);
+  assert.strictEqual(match.host.get('IN._releaseFireAfterTick'), false);
+
+  match.host.run(`G.player.respawnT = 0; simulate(${SIM.FIXED * 2})`);
+  assert.strictEqual(match.host.get('G.player.alive'), true);
+  assert.strictEqual(match.host.get('G.player.ammo'),
+    match.host.get("WBY[G.player.weapon].mag"),
+    'the respawn must not open with an unasked-for shot');
+  assert.ok(match.host.get('G.player.shield') > 0,
+    'and must not pop its own spawn shield');
+});
+
+test('a respawn refills every weapon, not just the one in hand', () => {
+  const match = SIM.createMatch({ latencyMs: 0, seed: 3 });
+
+  /* Run the rifle dry and stow it. The per-weapon store outlives the death
+     that emptied it, so a respawn that only tops up the held weapon hands the
+     dry magazine straight back on the next swap. */
+  match.host.run(`
+    switchWeapon('rifle');
+    G.player.ammo = 0; G.player.reserve = 0;
+    syncPlayerAmmoStore();
+    switchWeapon('smg');
+    G.player.ammo = 4; syncPlayerAmmoStore();
+    tryReload(G.player);
+  `);
+  assert.ok(match.host.get('VM.reloadT') > 0, 'the viewmodel should be reloading');
+
+  match.host.run(`killActor(G.player, null); G.player.respawnT = 0;`);
+  match.host.run(`simulate(${SIM.FIXED * 2})`);
+  assert.strictEqual(match.host.get('G.player.alive'), true);
+  assert.strictEqual(match.host.get('VM.reloadT'), 0,
+    'a death mid-reload must not leave the new life swapping a full magazine');
+
+  match.host.run("switchWeapon('rifle');");
+  assert.strictEqual(match.host.get('G.player.ammo'), match.host.get('WBY.rifle.mag'),
+    'the stowed weapon must come back loaded');
+  assert.strictEqual(match.host.get('G.player.reserve'),
+    match.host.get('WBY.rifle.reserve'),
+    'and with its reserve restored, or it cannot be reloaded either');
+});
+
+test("a guest's own respawn refills the weapons it is not holding", () => {
+  const match = SIM.createMatch({ latencyMs: LIVE_LATENCY_MS, seed: 5 });
+  match.run(1.0);
+  const onHost = `G.actors.find(a => a.netId === ${JSON.stringify(SIM.GUEST_ID)})`;
+
+  /* A guest never runs respawnActor for itself -- the snapshot brings it back
+     -- so its own store needs topping up on the alive edge. Empty the rifle on
+     both sides so the two simulations start from the same magazine. */
+  match.guest.run("switchWeapon('rifle');");
+  match.run(0.4);
+  match.host.run(`{
+    const a = ${onHost};
+    a.ammo = 0; a.reserve = 0;
+    a._ammoBy[a.weapon] = { ammo: 0, reserve: 0 };
+  }`);
+  match.guest.run('G.player.ammo = 0; G.player.reserve = 0; syncPlayerAmmoStore();');
+  match.guest.run("switchWeapon('smg');");
+  match.run(0.4);
+
+  match.host.run(`killActor(${onHost}, null);`);
+  match.run(4.0);      // death, the 3s respawn timer, and a snapshot to carry it
+  assert.strictEqual(match.guest.get('G.player.alive'), true,
+    'the guest should be back on its feet');
+
+  match.guest.run("switchWeapon('rifle');");
+  assert.strictEqual(match.guest.get('G.player.ammo'), match.guest.get('WBY.rifle.mag'),
+    'the guest must predict a loaded magazine rather than the one it died with');
+  assert.strictEqual(match.guest.get('G.player.reserve'),
+    match.guest.get('WBY.rifle.reserve'));
+
+  match.run(0.5);
+  assert.strictEqual(match.guest.get('G.player.ammo'), match.guest.get('WBY.rifle.mag'),
+    'and the host must agree once the swap is acknowledged');
+});
+
+test('hiding touch controls cancels an armed semi-auto without firing', () => {
+  const match = SIM.createMatch({ latencyMs: 0, seed: 3 });
+  match.host.run(`
+    switchWeapon('shotgun');
+    IN.touchSemiArmed = true;
+  `);
+  const seq = match.host.get('IN.fireSeq');
+
+  match.host.run('touchReleaseAll();');
+
+  assert.strictEqual(match.host.get('IN.touchSemiArmed'), false);
+  assert.strictEqual(match.host.get('IN.firing'), false);
+  assert.strictEqual(match.host.get('IN.fireSeq'), seq);
+});
+
+test('semi-auto touch holds to aim, releases to fire, and cancels safely', () => {
+  const match = SIM.createMatch({ latencyMs: 0, seed: 3 });
+  match.host.run(`
+    switchWeapon('rifle');
+    G.player.vel.x = 6;
+    touchFirePress({ pointerId: 8, clientX: 900, clientY: 400,
+      preventDefault() {} });
+  `);
+  const ammo = match.host.get('G.player.ammo');
+  const seq = match.host.get('IN.fireSeq');
+  match.host.run(`simulate(${SIM.FIXED})`);
+
+  assert.strictEqual(match.host.get('G.player.ammo'), ammo,
+    'holding a semi-auto must not fire early');
+  assert.strictEqual(match.host.get('G.player.aiming'), true,
+    'the held trigger should keep the aiming pose active');
+
+  match.host.run('touchFireRelease(null, false);');
+  match.host.run(`simulate(${SIM.FIXED})`);
+  assert.strictEqual(match.host.get('G.player.ammo'), ammo - 1);
+  assert.strictEqual(match.host.get('IN.fireSeq'), seq + 1);
+
+  match.host.run(`
+    touchFirePress({ pointerId: 9, clientX: 900, clientY: 400,
+      preventDefault() {} });
+    touchFireRelease(null, true);
+  `);
+  assert.strictEqual(match.host.get('IN.fireSeq'), seq + 1,
+    'pointercancel must abort rather than discharge');
+});
+
+test('the touch FIRE button keeps the SMG press-and-hold path', () => {
+  const match = SIM.createMatch({ latencyMs: 0, seed: 3 });
+  match.host.run(`
+    touchFirePress({ pointerId: 8, clientX: 900, clientY: 400,
+      preventDefault() {} });
+  `);
+  const ammo = match.host.get('G.player.ammo');
+  for (let i = 0; i < 12; i++) match.host.run(`simulate(${SIM.FIXED})`);
+  assert.ok(match.host.get('G.player.ammo') < ammo - 1,
+    'holding FIRE should sustain an SMG burst');
+
+  match.host.run('touchFireRelease(null, false);');
+  const releasedAmmo = match.host.get('G.player.ammo');
+  for (let i = 0; i < 12; i++) match.host.run(`simulate(${SIM.FIXED})`);
+  assert.strictEqual(match.host.get('G.player.ammo'), releasedAmmo);
+});
+
+test('the harness runs the real client and converges host and guest', () => {
+  const match = SIM.createMatch({ latencyMs: LIVE_LATENCY_MS, seed: 5 });
+  match.run(1.5);
+
+  assert.strictEqual(match.host.get('NET.mode'), 'host');
+  assert.strictEqual(match.guest.get('NET.mode'), 'guest');
+  assert.strictEqual(match.guest.get('G.actors.length'), 2,
+    'guest should have itself plus a replica of the host');
+  assert.ok(match.guest.get('NET.lastRawSnapshot && NET.lastRawSnapshot.tick > 0'),
+    'guest must retain the validated raw migration image');
+  assert.ok(match.guest.get('NET.lastCheckpoint && NET.lastCheckpoint.tick > 0'),
+    'guest must retain the validated low-rate checkpoint');
+
+  /* Nothing was dropped for a stale epoch: the harness models the relay's
+     check, so this failing means an outbound message lost authorityEpoch. */
+  assert.strictEqual(match.link.stats.staleEpoch, 0);
+  assert.ok(match.host.get("G.actors.find(a => a.controller === 'remote').inputAck") > 10,
+    'host should be acknowledging guest input');
+
+  const truth = match.host.get('G.player.pos.x');
+  const seen = match.guest.get(
+    `G.actors.find(a => a.netId === ${JSON.stringify(SIM.HOST_ID)}).pos.x`);
+  assert.ok(Math.abs(truth - seen) < 1.0,
+    `guest replica should track the host (truth ${truth}, seen ${seen})`);
+});
+
+function spawnDonutForGuest(match, age = 0) {
+  match.host.run(`
+    {
+      const owner = G.player;
+      const killer = G.actors.find(a => a.controller === 'remote');
+      owner.pos.x = 0; owner.pos.y = 0; owner.pos.z = 0;
+      killer.pos.x = -3; killer.pos.y = 0; killer.pos.z = 0;
+      const donut = spawnDonut(owner, killer);
+      donut.t = ${age};
+      owner.alive = false;
+      owner.respawnT = 10;
+      netAfterSimulation(0, true);
+    }
+  `);
+}
+
+test('a host donut reaches a guest at the same position and establishes match mode', () => {
+  const match = SIM.createMatch({
+    latencyMs: LIVE_LATENCY_MS, seed: 12, hostMode: 'kc', guestMode: 'dm'
+  });
+  spawnDonutForGuest(match);
+  const authority = match.link.latestSnapshot().donuts[0];
+  match.run(0.35);
+
+  assert.strictEqual(match.guest.get('G.mode'), 'kc',
+    'the snapshot, not the guest URL, owns match mode');
+  assert.strictEqual(match.guest.get(`JSON.stringify((() => {
+    const d = G.donuts[0];
+    return d && { id: d.id, x: d.x, y: d.y, z: d.z };
+  })())`), JSON.stringify({
+    id: authority.id, x: authority.x, y: authority.y, z: authority.z
+  }));
+});
+
+test('a guest walking onto a donut earns exactly one host-credited confirm', () => {
+  const match = SIM.createMatch({ latencyMs: LIVE_LATENCY_MS, seed: 13, mode: 'kc' });
+  spawnDonutForGuest(match);
+  match.run(0.35);
+  match.guest.run(`
+    G.player.yaw = Math.PI / 2;
+    G.player.aimYaw = G.player.yaw;
+    KEY.KeyW = true;
+  `);
+  match.run(1.2);
+  match.guest.run('KEY.KeyW = false;');
+  match.run(0.5);
+
+  const hostScore = () => match.host.get(
+    `G.actors.find(a => a.netId === ${JSON.stringify(SIM.GUEST_ID)}).confirms`);
+  assert.strictEqual(hostScore(), 1, 'only the host may award the pickup');
+  assert.strictEqual(match.guest.get('G.player.confirms'), 1,
+    'the score should return to the collector by snapshot');
+  assert.strictEqual(match.host.get('G.donuts.length'), 0);
+  match.run(1.0);
+  assert.strictEqual(hostScore(), 1, 'continued contact must not collect it again');
+  assert.strictEqual(match.guest.get('G.player.confirms'), 1);
+});
+
+test('a replayed confirm event renders once and never changes a guest score', () => {
+  const match = SIM.createMatch({ latencyMs: 5, seed: 14, mode: 'kc' });
+  match.run(0.4);
+  match.guest.run(`
+    globalThis.__confirmFeedback = 0;
+    const __realRenderDonutOutcome = renderDonutOutcome;
+    renderDonutOutcome = function () {
+      __confirmFeedback++;
+      return __realRenderDonutOutcome.apply(null, arguments);
+    };
+  `);
+  const before = match.guest.get('G.player.confirms');
+  const event = {
+    id: 1000,
+    kind: 'confirm',
+    collector: SIM.GUEST_ID,
+    owner: SIM.HOST_ID,
+    killer: SIM.GUEST_ID,
+    deny: false,
+    at: [0, 0.35, 0]
+  };
+  match.guest.context.__wire = JSON.stringify({
+    t: 'event', v: SIM.NETP.VERSION,
+    authorityEpoch: 1, round: 1, events: [event]
+  });
+  match.guest.run('netHandleWire(__wire)');
+  match.guest.run('NET.authorityEpoch = 2;');
+  match.guest.context.__wire = JSON.stringify({
+    t: 'event', v: SIM.NETP.VERSION,
+    authorityEpoch: 2, round: 1, events: [event]
+  });
+  match.guest.run('netHandleWire(__wire)');
+
+  assert.strictEqual(match.guest.get('__confirmFeedback'), 1,
+    'event sequence deduplication must span authority epochs');
+  assert.strictEqual(match.guest.get('G.player.confirms'), before,
+    'confirm events are feedback, not scoring authority');
+});
+
+test('departed donut owners and killers cannot poison feedback or host migration', () => {
+  const match = SIM.createMatch({ latencyMs: 20, seed: 19, combatants: 4, mode: 'kc' });
+  match.run(0.3);
+  match.guest.run(`
+    globalThis.__departedConfirmFeedback = 0;
+    const __realDepartedOutcome = renderDonutOutcome;
+    renderDonutOutcome = function () {
+      __departedConfirmFeedback++;
+      return __realDepartedOutcome.apply(null, arguments);
+    };
+  `);
+
+  match.host.run(`
+    {
+      NET.members.push({ id: 'departed-1', name: 'LEAVER', role: 'guest', slot: 2 });
+      netAdmitArrivals();
+      const departed = G.actors.find(actor => actor.netId === 'departed-1');
+      G.player.pos.x = departed.pos.x = 0;
+      G.player.pos.y = departed.pos.y = 0;
+      G.player.pos.z = departed.pos.z = 0;
+      const staleOwner = spawnDonut(departed, G.player);
+      const staleKiller = spawnDonut(G.player, departed);
+      staleOwner.x = staleKiller.x = 0;
+      staleOwner.y = staleKiller.y = 0.35;
+      staleOwner.z = staleKiller.z = 0;
+
+      NET.members = NET.members.filter(member => member.id !== 'departed-1');
+      netPruneDepartedPlayers();
+      netAfterSimulation(0, true);
+    }
+  `);
+
+  const postDeparture = match.link.latestSnapshot();
+  assert.strictEqual(postDeparture.donuts.length, 2,
+    'the pickup must outlive the connection that created it');
+  assert.ok(postDeparture.donuts.some(donut =>
+    donut.owner === null && donut.ownerNetId === null),
+  'a departed owner must be removed from the replicated actor reference');
+  assert.ok(postDeparture.donuts.some(donut =>
+    donut.killer === null && donut.killerNetId === null),
+  'a departed killer must be removed from the replicated actor reference');
+  match.guest.context.__candidateSnapshot = JSON.stringify(postDeparture);
+  assert.strictEqual(match.guest.get('netValidSnapshot(JSON.parse(__candidateSnapshot))'), true,
+    'an otherwise valid snapshot must survive stale donut references');
+
+  match.host.run(`
+    {
+      G.actors.forEach((actor, index) => {
+        actor.pos.x = 20 + index; actor.pos.y = 0; actor.pos.z = 18;
+        actor.vel.x = actor.vel.y = actor.vel.z = 0;
+      });
+      const collector = G.actors.find(actor => actor.netId === 'bot-2');
+      collector.pos.x = 0; collector.pos.y = 0; collector.pos.z = 0;
+      updateDonuts(0);
+      netAfterSimulation(0, true);
+    }
+  `);
+
+  const checkpoint = match.link.latestCheckpoint();
+  match.run(0.15);
+  match.migrateHost();
+  for (let i = 0; i < 60 && match.guest.get('NET.phase') !== 'migrating'; i++) match.tick();
+  assert.strictEqual(match.guest.get('NET.phase'), 'migrating',
+    'the relay-cached checkpoint must remain safe to hydrate');
+  for (let i = 0; i < 60 && match.guest.get('NET.phase') !== 'playing'; i++) match.tick();
+  assert.strictEqual(match.guest.get('NET.phase'), 'playing',
+    'the cached checkpoint must remain safe for seamless promotion');
+  assert.strictEqual(match.guest.get('G.started'), true,
+    'the round and its scores must not be abandoned to the lobby');
+
+  assert.strictEqual(checkpoint.confirmEvents.length, 2);
+  assert.ok(checkpoint.confirmEvents.some(event => event.owner === null),
+    'the stale owner must not enter the checkpoint event');
+  assert.ok(checkpoint.confirmEvents.some(event => event.killer === null),
+    'the stale killer must not enter the checkpoint event');
+  assert.strictEqual(Object.hasOwn(checkpoint, 'donuts'), false,
+    'checkpoint donuts duplicate the fresher snapshot cache');
+  assert.ok(checkpoint.actors.every(actor => !Object.hasOwn(actor, 'confirms')),
+    'checkpoint confirms duplicate the fresher snapshot actor state');
+  assert.strictEqual(match.guest.get('__departedConfirmFeedback'), 2,
+    'both host-awarded pickups need guest-side feedback');
+  assert.strictEqual(match.guest.get('NET.lastCheckpoint.confirmEvents.length'), 2,
+    'the stale references must not invalidate the whole checkpoint');
+});
+
+test('a replacement bot cannot inherit an old donut through its recycled netId', () => {
+  const match = SIM.createMatch({ latencyMs: 20, seed: 23, combatants: 4, mode: 'kc' });
+  match.run(0.3);
+  match.guest.run(`
+    globalThis.__replacementConfirmFeedback = 0;
+    const __realReplacementOutcome = renderDonutOutcome;
+    renderDonutOutcome = function () {
+      __replacementConfirmFeedback++;
+      return __realReplacementOutcome.apply(null, arguments);
+    };
+  `);
+
+  match.host.run(`
+    {
+      G.actors.forEach((actor, index) => {
+        actor.pos.x = 20 + index; actor.pos.y = 0; actor.pos.z = 18;
+        actor.vel.x = actor.vel.y = actor.vel.z = 0;
+      });
+      const departedBot = G.actors.find(actor => actor.netId === 'bot-2');
+      departedBot.pos.x = 0; departedBot.pos.y = 0; departedBot.pos.z = 0;
+      const donut = spawnDonut(departedBot, G.player);
+      donut.x = 0; donut.y = 0.35; donut.z = 0;
+      departedBot.alive = false;
+      globalThis.__departedBotId = departedBot.id;
+
+      NET.members.push(
+        { id: 'jersey-2', name: 'JERSEY', role: 'guest', slot: 2 });
+      netAdmitArrivals();
+      NET.members = NET.members.filter(member => member.id !== 'jersey-2');
+      netPruneDepartedPlayers();
+
+      G.actors.forEach((actor, index) => {
+        actor.pos.x = 20 + index; actor.pos.y = 0; actor.pos.z = 18;
+        actor.vel.x = actor.vel.y = actor.vel.z = 0;
+      });
+      const replacement = G.actors.find(actor => actor.netId === 'bot-2');
+      globalThis.__replacementBotId = replacement.id;
+      replacement.pos.x = 0; replacement.pos.y = 0; replacement.pos.z = 0;
+      updateDonuts(0);
+      netAfterSimulation(0, true);
+    }
+  `);
+
+  assert.notStrictEqual(match.host.get('__replacementBotId'),
+    match.host.get('__departedBotId'), 'the fixture must replace, not retain, the bot actor');
+  const checkpoint = match.link.latestCheckpoint();
+  const event = checkpoint.confirmEvents[0];
+  assert.strictEqual(event.collector, 'bot-2');
+  assert.strictEqual(event.owner, null,
+    'a recycled netId is not proof that the replacement owns the old donut');
+  match.host.context.__replacementEvent = JSON.stringify(event);
+  assert.strictEqual(match.host.get(`netValidEvent(JSON.parse(__replacementEvent),
+    new Set(G.actors.map(netActorId)))`), true,
+    'the host must never queue feedback that its own wire validator rejects');
+
+  match.run(0.15);
+  assert.strictEqual(match.guest.get('__replacementConfirmFeedback'), 1,
+    'a peer must render the replacement bot\'s earned stolen confirm');
+  match.migrateHost();
+  for (let i = 0; i < 60 && match.guest.get('NET.phase') !== 'migrating'; i++) match.tick();
+  assert.strictEqual(match.guest.get('NET.phase'), 'migrating');
+  for (let i = 0; i < 60 && match.guest.get('NET.phase') !== 'playing'; i++) match.tick();
+  assert.strictEqual(match.guest.get('NET.phase'), 'playing',
+    'the replacement pickup must leave a checkpoint safe for promotion');
+});
+
+test('a post-migration arrival cannot deny a donut by recycling its numeric id', () => {
+  const match = SIM.createMatch({ latencyMs: 20, seed: 24, combatants: 4, mode: 'kc' });
+  match.run(0.3);
+  match.host.run(`
+    {
+      G.actors.forEach((actor, index) => {
+        actor.pos.x = 20 + index; actor.pos.y = 0; actor.pos.z = 18;
+      });
+      NET.members.push({ id: 'drop-1', name: 'FIRST', role: 'guest', slot: 4 });
+      netAdmitArrivals();
+      const owner = G.actors.find(actor => actor.netId === 'drop-1');
+      owner.pos.x = 0; owner.pos.y = 0; owner.pos.z = 0;
+      const donut = spawnDonut(owner, G.player);
+      donut.x = 0; donut.y = 0.35; donut.z = 0;
+      owner.alive = false;
+      NET.checkpointDirty = true;
+      netAfterSimulation(0, true);
+    }
+  `);
+
+  match.migrateHost();
+  for (let i = 0; i < 60 && match.guest.get('NET.phase') !== 'migrating'; i++) match.tick();
+  assert.strictEqual(match.guest.get('NET.phase'), 'migrating');
+  for (let i = 0; i < 60 && match.guest.get('NET.phase') !== 'playing'; i++) match.tick();
+  assert.strictEqual(match.guest.get('NET.phase'), 'playing');
+  assert.strictEqual(match.guest.get('G.donuts[0].owner'), 5,
+    'the migration fixture must retain the departed owner\'s numeric id');
+  assert.strictEqual(match.guest.get('G.donuts[0].ownerNetId'), 'drop-1');
+
+  match.guest.run(`
+    {
+      NET.members.push({ id: 'drop-2', name: 'SECOND', role: 'guest', slot: 4 });
+      netAdmitArrivals();
+      G.actors.forEach((actor, index) => {
+        actor.pos.x = 20 + index; actor.pos.y = 0; actor.pos.z = 18;
+        actor.vel.x = actor.vel.y = actor.vel.z = 0;
+      });
+      const collector = G.actors.find(actor => actor.netId === 'drop-2');
+      globalThis.__arrivalId = collector.id;
+      collector.pos.x = 0; collector.pos.y = 0; collector.pos.z = 0;
+      updateDonuts(0);
+    }
+  `);
+
+  assert.strictEqual(match.guest.get('__arrivalId'), 5,
+    'the new arrival must exercise numeric-id reuse');
+  assert.strictEqual(match.guest.get("G.actors.find(actor => actor.netId === 'drop-2').confirms"), 1,
+    'an unrelated arrival earns a stolen confirm instead of a false denial');
+  assert.strictEqual(match.guest.get('G.donutStats.stolen'), 1);
+  assert.strictEqual(match.guest.get('G.donutStats.denied'), 0);
+  const event = match.guest.get("JSON.stringify(NET.eventQueue.find(item => item.kind === 'confirm'))");
+  match.guest.context.__arrivalEvent = event;
+  assert.deepStrictEqual(JSON.parse(event), {
+    id: JSON.parse(event).id,
+    kind: 'confirm', collector: 'drop-2', owner: null, killer: null,
+    deny: false, at: [0, 0.35, 0]
+  });
+  assert.strictEqual(match.guest.get(`netValidEvent(JSON.parse(__arrivalEvent),
+    new Set(G.actors.map(netActorId)))`), true,
+    'numeric-id reuse must not create a malformed denied event');
+  match.guest.run('netAfterSimulation(0, true);');
+  const checkpoint = match.link.latestCheckpoint();
+  match.guest.context.__arrivalCheckpoint = JSON.stringify(checkpoint);
+  assert.strictEqual(match.guest.get('netValidCheckpoint(JSON.parse(__arrivalCheckpoint))'), true,
+    'the earned pickup must remain safe in the promoted host\'s checkpoint');
+});
+
+test('one malformed donut rejects its whole snapshot before any state is applied', () => {
+  const match = SIM.createMatch({ latencyMs: 5, seed: 15, mode: 'kc' });
+  spawnDonutForGuest(match);
+  match.run(0.25);
+  const before = {
+    tick: match.guest.get('NET.lastSnapshotTick'),
+    kills: match.guest.get(`G.actors.find(a => a.netId === ${JSON.stringify(SIM.HOST_ID)}).kills`),
+    donuts: match.guest.get('JSON.stringify(G.donuts)')
+  };
+  const bad = structuredClone(match.link.latestSnapshot());
+  bad.tick = before.tick + 100;
+  bad.time += 1;
+  bad.actors.find(actor => actor.netId === SIM.HOST_ID).kills += 10;
+  bad.donuts.push({ ...bad.donuts[0], id: bad.donuts[0].id + 1, x: 1000 });
+  match.guest.context.__wire = JSON.stringify(bad);
+  match.guest.run('netHandleWire(__wire)');
+
+  assert.strictEqual(match.guest.get('NET.lastSnapshotTick'), before.tick);
+  assert.strictEqual(match.guest.get(
+    `G.actors.find(a => a.netId === ${JSON.stringify(SIM.HOST_ID)}).kills`), before.kills);
+  assert.strictEqual(match.guest.get('JSON.stringify(G.donuts)'), before.donuts,
+    'the valid donut beside the malformed one must not be half-applied');
+});
+
+test('snapshot and checkpoint validation enforce map identity and world state', () => {
+  const match = SIM.createMatch({ latencyMs: 5, seed: 20, mode: 'kc' });
+  spawnDonutForGuest(match);
+  const base = structuredClone(match.link.latestSnapshot());
+  const donut = base.donuts[0];
+  const accepted = candidate => {
+    match.guest.context.__candidateSnapshot = JSON.stringify(candidate);
+    return match.guest.get('netValidSnapshot(JSON.parse(__candidateSnapshot))');
+  };
+
+  const atCapacity = structuredClone(base);
+  atCapacity.donuts = Array.from({ length: 24 }, (_, index) => ({
+    ...donut, id: index + 1
+  }));
+  assert.strictEqual(accepted(atCapacity), true);
+
+  const overCapacity = structuredClone(atCapacity);
+  overCapacity.donuts.push({ ...donut, id: 25 });
+  assert.strictEqual(accepted(overCapacity), false,
+    'a snapshot may not exceed the fixed render and simulation pool');
+
+  const dmWithDonut = structuredClone(base);
+  dmWithDonut.mode = 'dm';
+  assert.strictEqual(accepted(dmWithDonut), false,
+    'deathmatch snapshots cannot smuggle kill-confirmed pickups');
+  dmWithDonut.donuts = [];
+  assert.strictEqual(accepted(dmWithDonut), true);
+
+  const wrongMap = structuredClone(base);
+  wrongMap.map = 'terminal';
+  assert.strictEqual(accepted(wrongMap), false,
+    'a snapshot for another map must be refused before its bounds are trusted');
+
+  const checkpoint = structuredClone(match.link.latestCheckpoint());
+  checkpoint.map = 'terminal';
+  match.guest.context.__wrongMapCheckpoint = JSON.stringify(checkpoint);
+  assert.strictEqual(match.guest.get(
+    'netValidCheckpoint(JSON.parse(__wrongMapCheckpoint))'), false,
+    'a checkpoint for another map must not become migration state');
+
+  const foreignOwner = structuredClone(base);
+  foreignOwner.donuts[0].owner = 99_999;
+  foreignOwner.donuts[0].ownerNetId = 'nobody-at-all';
+  assert.strictEqual(accepted(foreignOwner), false,
+    'each live donut reference must match an actor in the same snapshot');
+});
+
+test('an authoritative snapshot removes donuts the host no longer lists', () => {
+  const match = SIM.createMatch({ latencyMs: 20, seed: 21, mode: 'kc' });
+  spawnDonutForGuest(match);
+  match.run(0.15);
+  assert.strictEqual(match.guest.get('G.donuts.length'), 1);
+
+  match.host.run(`
+    G.actors.forEach((actor, index) => {
+      actor.pos.x = 20 + index; actor.pos.y = 0; actor.pos.z = 18;
+    });
+    G.donuts[0].t = DONUT_LIFETIME;
+    updateDonuts(0);
+    netAfterSimulation(0, true);
+  `);
+  match.run(0.15);
+  assert.strictEqual(match.guest.get('G.donuts.length'), 0,
+    'reconciliation is by id, including the removal half');
+});
+
+test('donut ids, remaining lifetime, and every surviving confirm score migrate', () => {
+  const match = SIM.createMatch({
+    latencyMs: LIVE_LATENCY_MS, seed: 16, combatants: 4, mode: 'kc'
+  });
+  match.run(0.5);
+  match.host.run(`
+    {
+      const owner = G.actors.find(a => a.controller === 'bot');
+      const killer = G.actors.find(a => a.controller === 'remote');
+      owner.pos.x = 0; owner.pos.y = 0; owner.pos.z = 0;
+      const donut = spawnDonut(owner, killer);
+      donut.t = 10.5;
+      G.actors.forEach((actor, index) => {
+        actor.pos.x = 25; actor.pos.y = 0; actor.pos.z = 18;
+        actor.vel.x = actor.vel.y = actor.vel.z = 0;
+        actor.confirms = index + 3;
+      });
+      netOnAuthoritativeConfirm(donut, killer, 'CONFIRMED');
+      NET.checkpointDirty = true;
+      netAfterSimulation(0, true);
+    }
+  `);
+  const cached = match.link.latestSnapshot();
+  const expectedScores = Object.fromEntries(cached.actors
+    .filter(actor => actor.netId !== SIM.HOST_ID)
+    .map(actor => [actor.netId, actor.confirms]));
+  assert.strictEqual(match.link.latestCheckpoint().confirmEvents.length, 1,
+    'pending confirm feedback must be cached without entering the relay legacy event list');
+
+  match.migrateHost();
+  for (let i = 0; i < 30 && match.guest.get('NET.phase') !== 'migrating'; i++)
+    match.tick();
+  assert.strictEqual(match.guest.get('NET.phase'), 'migrating');
+  assert.strictEqual(match.guest.get('JSON.stringify(G.donuts.map(d => d.id))'),
+    JSON.stringify(cached.donuts.map(donut => donut.id)));
+  assert.strictEqual(match.guest.get('G.donuts[0].t'), cached.donuts[0].t,
+    'hydration must retain elapsed lifetime rather than start another twelve seconds');
+  assert.ok(match.guest.get(`NET.eventQueue.some(event =>
+    event.kind === 'confirm' && event.id === ${match.link.latestCheckpoint().confirmEvents[0].id})`),
+  'the promoted host must re-queue confirm feedback cached at handover');
+
+  for (let i = 0; i < 30 && match.guest.get('NET.phase') !== 'playing'; i++)
+    match.tick();
+  assert.strictEqual(match.guest.get('NET.mode'), 'host');
+  assert.strictEqual(match.guest.get('G.mode'), 'kc');
+  assert.strictEqual(match.guest.get(`JSON.stringify(Object.fromEntries(
+    G.actors.map(actor => [actor.netId, actor.confirms])))`), JSON.stringify(expectedScores));
+  match.run(1.8);
+  assert.strictEqual(match.guest.get('G.donuts.length'), 0,
+    'the restored donut must expire after its remaining lifetime, not a reset lifetime');
+});
+
+test('a peer renders chronological confirm feedback replayed by a promoted host', () => {
+  const match = SIM.createMatch({ latencyMs: 20, seed: 25, combatants: 4, mode: 'kc' });
+  match.run(0.3);
+  match.host.run(`
+    {
+      const owner = G.actors.find(actor => actor.netId === 'bot-2');
+      const collector = G.actors.find(actor => actor.netId === ${JSON.stringify(SIM.GUEST_ID)});
+      const donut = spawnDonut(owner, collector);
+      netOnAuthoritativeConfirm(donut, collector, 'CONFIRMED');
+      netOnAuthoritativeRespawn(owner);
+      NET.checkpointDirty = true;
+      netAfterSimulation(0, true);
+    }
+  `);
+  const checkpoint = match.link.latestCheckpoint();
+  assert.strictEqual(checkpoint.confirmEvents.length, 1);
+  assert.strictEqual(checkpoint.events.length, 1);
+  assert.ok(checkpoint.confirmEvents[0].id < checkpoint.events[0].id,
+    'the confirm must chronologically precede the legacy event in the split checkpoint');
+
+  match.migrateHost();
+  for (let i = 0; i < 60 && match.guest.get('NET.phase') !== 'migrating'; i++) match.tick();
+  assert.strictEqual(match.guest.get('NET.phase'), 'migrating');
+  const replay = match.guest.get('JSON.stringify(NET.eventQueue)');
+  assert.deepStrictEqual(JSON.parse(replay).map(event => event.id),
+    [checkpoint.confirmEvents[0].id, checkpoint.events[0].id],
+    'the promoted host must restore the original event chronology');
+
+  match.host.context.__migrationReplay = replay;
+  match.host.run(`
+    globalThis.__migrationConfirmFeedback = 0;
+    const __realMigrationOutcome = renderDonutOutcome;
+    renderDonutOutcome = function () {
+      __migrationConfirmFeedback++;
+      return __realMigrationOutcome.apply(null, arguments);
+    };
+    NET.actorManifest = new Set(G.actors.map(netActorId));
+    NET.lastEventSeq = 0;
+    JSON.parse(__migrationReplay).forEach(netApplyEvent);
+  `);
+  assert.strictEqual(match.host.get('__migrationConfirmFeedback'), 1,
+    'a receiving peer must render the lower-id confirm before advancing past it');
+});
+
+test('a mid-round joiner promoted before its first snapshot adopts the cached mode', () => {
+  const match = SIM.createMatch({
+    latencyMs: LIVE_LATENCY_MS, seed: 22, combatants: 4,
+    hostMode: 'kc', guestMode: 'dm'
+  });
+  match.guest.run('NET.lastSnapshotTick = 1e9;');
+  match.host.run(`
+    {
+      const owner = G.player;
+      const killer = G.actors.find(actor => actor.controller === 'remote');
+      owner.pos.x = 0; owner.pos.y = 0; owner.pos.z = 0;
+      const donut = spawnDonut(owner, killer);
+      donut.t = 10.5;
+      G.actors.forEach((actor, index) => {
+        actor.pos.x = 20 + index; actor.pos.y = 0; actor.pos.z = 18;
+        actor.vel.x = actor.vel.y = actor.vel.z = 0;
+      });
+      netAfterSimulation(0, true);
+    }
+  `);
+  assert.strictEqual(match.guest.get('G.mode'), 'dm',
+    'the joiner has not accepted any authoritative snapshot yet');
+  assert.strictEqual(match.link.latestSnapshot().donuts.length, 1);
+
+  match.migrateHost();
+  for (let i = 0; i < 90 && match.guest.get('NET.phase') !== 'migrating'; i++) match.tick();
+  assert.strictEqual(match.guest.get('NET.phase'), 'migrating');
+  for (let i = 0; i < 90 && match.guest.get('NET.phase') !== 'playing'; i++) match.tick();
+  assert.strictEqual(match.guest.get('NET.phase'), 'playing');
+  assert.strictEqual(match.guest.get('G.mode'), 'kc',
+    'migration hydration must establish mode independently of ordinary snapshots');
+  assert.strictEqual(match.guest.get('G.donuts.length'), 1);
+  match.run(1.8);
+  assert.strictEqual(match.guest.get('G.donuts.length'), 0,
+    'the promoted host must run kill-confirmed pickup expiry');
+});
+
+test('guest contact predicts a hide but never a confirm', () => {
+  const match = SIM.createMatch({ latencyMs: LIVE_LATENCY_MS, seed: 17, mode: 'kc' });
+  match.run(0.4);
+  match.host.run(`
+    {
+      const owner = G.player;
+      const killer = G.actors.find(a => a.controller === 'remote');
+      owner.pos.x = 0; owner.pos.y = 0; owner.pos.z = 0;
+      spawnDonut(owner, killer);
+      G.actors.forEach(actor => {
+        actor.pos.x = 25; actor.pos.y = 0; actor.pos.z = 18;
+        actor.vel.x = actor.vel.y = actor.vel.z = 0;
+      });
+      netAfterSimulation(0, true);
+    }
+  `);
+  match.run(0.25);
+  assert.strictEqual(match.guest.get('G.donuts.length'), 1);
+  const before = match.guest.get('G.player.confirms');
+  match.guest.run(`
+    G.player.pos.x = 0; G.player.pos.y = 0; G.player.pos.z = 0;
+    updateDonuts(${SIM.FIXED});
+  `);
+  assert.strictEqual(match.guest.get('G.donuts.length'), 0,
+    'contact should hide the local replica immediately');
+  assert.strictEqual(match.guest.get('G.player.confirms'), before,
+    'prediction must not promise the score');
+  assert.strictEqual(match.host.get(
+    `G.actors.find(a => a.netId === ${JSON.stringify(SIM.GUEST_ID)}).confirms`), 0);
+
+  match.run(0.3);
+  assert.strictEqual(match.guest.get('G.donuts.length'), 1,
+    'an authoritative snapshot that still contains it should bring it back');
+  assert.strictEqual(match.guest.get('G.player.confirms'), before);
+});
+
+test('a guest URL mode neither defines the match nor authorizes donut spawning', () => {
+  const match = SIM.createMatch({
+    latencyMs: LIVE_LATENCY_MS, seed: 18, hostMode: 'dm', guestMode: 'kc'
+  });
+  assert.strictEqual(match.guest.get('G.mode'), 'kc',
+    'the harness starts with the mismatched URL mode this regression exposed');
+  assert.strictEqual(match.guest.get('spawnDonut(G.player, G.player)'), null);
+  assert.strictEqual(match.guest.get('G.donuts.length'), 0);
+
+  match.run(0.35);
+  assert.strictEqual(match.guest.get('G.mode'), 'dm',
+    'the first host snapshot must replace the guest-local choice');
+  match.guest.run(`
+    setGameMode('kc');
+    killActor(G.actors.find(actor => !actor.isPlayer), G.player);
+  `);
+  assert.strictEqual(match.guest.get('G.donuts.length'), 0,
+    'even a stale local kc flag cannot mint network scoring currency');
+});
+
+test('a stale authority epoch gets the guest\'s input dropped', () => {
+  const match = SIM.createMatch({ latencyMs: LIVE_LATENCY_MS, seed: 5 });
+  match.run(1.0);
+
+  match.guest.run('NET.authorityEpoch = 99;');
+  /* Input already on the wire when the epoch changed carried a live one and is
+     still delivered, so the ack keeps climbing briefly. Let that drain before
+     taking the reading, or the test is asserting against packets that were
+     legitimately in flight. */
+  match.run(0.4);
+  const ackBefore = match.host.get("G.actors.find(a => a.controller === 'remote').inputAck");
+  match.run(1.0);
+
+  assert.ok(match.link.stats.staleEpoch > 0, 'relay model should have rejected input');
+  assert.strictEqual(
+    match.host.get("G.actors.find(a => a.controller === 'remote').inputAck"),
+    ackBefore,
+    'host must not advance the ack for input sent under a dead epoch');
+});
+
+test('a promoted guest resumes the same authoritative round from the cached checkpoint', () => {
+  const match = SIM.createMatch({
+    latencyMs: LIVE_LATENCY_MS, seed: 9, combatants: 4
+  });
+  match.run(1.0);
+
+  match.host.run(`
+    {
+      const a = G.actors.find(actor => actor.netId === ${JSON.stringify(SIM.GUEST_ID)});
+      a.pos.x = 2.345; a.pos.y = 0; a.pos.z = -4.567;
+      a.vel.x = 0.75; a.vel.y = 0; a.vel.z = -0.25;
+      a.kills = 11; a.deaths = 4; a.streak = 3; a.bestStreak = 6;
+      a.weapon = 'smg'; a.ammo = 7; a.reserve = 41;
+      a._ammoBy = {
+        smg: { ammo: 7, reserve: 41 },
+        rifle: { ammo: 9, reserve: 22 }
+      };
+      NET.eventSeq = 17;
+      NET.checkpointDirty = true;
+      netAfterSimulation(0, true);
+    }
+  `);
+  const cached = match.link.latestSnapshot();
+  const cachedActor = cached.actors.find(actor => actor.netId === SIM.GUEST_ID);
+  assert.ok(cachedActor, 'the migration image should contain the promoted actor');
+  assert.strictEqual(match.link.latestCheckpoint().tick, cached.tick,
+    'the forced checkpoint should be available at the same boundary');
+
+  /* Deliberately put prediction somewhere visibly different. Hydration must
+     choose the last authority everybody observed, not this private display. */
+  match.guest.run('G.player.pos.x = 19; G.player.pos.z = 19;');
+  match.migrateHost();
+  for (let i = 0; i < 30 && match.guest.get('NET.phase') !== 'migrating'; i++)
+    match.tick();
+
+  assert.strictEqual(match.guest.get('NET.phase'), 'migrating');
+  assert.strictEqual(match.guest.get('G.tick'), cached.tick,
+    'hydration must restore the exact authoritative tick');
+  assert.strictEqual(match.guest.get('G.time'), cached.time,
+    'hydration must restore the exact authoritative time');
+  assert.strictEqual(match.guest.get('G.player.pos.x'), cachedActor.pos[0],
+    'the promoted player deliberately rewinds to the shared authority');
+  assert.strictEqual(match.guest.get('G.player.pos.z'), cachedActor.pos[2]);
+  assert.strictEqual(match.guest.get('G.player.kills'), 11);
+  assert.strictEqual(match.guest.get('G.player.deaths'), 4);
+  assert.strictEqual(match.guest.get('G.player.ammo'), 7);
+  assert.strictEqual(match.guest.get('G.player._ammoBy.rifle.ammo'), 9,
+    'slow per-weapon ammo must come from the low-rate checkpoint');
+  assert.strictEqual(match.guest.get('G.player._ammoBy.rifle.reserve'), 22);
+  assert.strictEqual(match.guest.get('G.fixedAcc'), 0,
+    'hydration must not carry a render-loop catch-up backlog');
+  assert.strictEqual(match.guest.get(`
+    (() => {
+      const actor = G.actors.find(a => a.netId === 'bot-2');
+      const expected = AI.createBrain({
+        id: actor.id, seed: 1000 + 1 * 77, skill: actor.skill
+      });
+      return actor.brain.phase === expected.phase &&
+        actor.brain.phase2 === expected.phase2 &&
+        actor.brain.strafeSign === expected.strafeSign;
+    })()
+  `), true, 'bot brain seed must come from stable bot-N, not shifted array position');
+
+  for (let i = 0; i < 30 &&
+       !(match.guest.get('NET.mode') === 'host' &&
+         match.guest.get('NET.phase') === 'playing'); i++) match.tick();
+
+  assert.strictEqual(match.guest.get('NET.mode'), 'host');
+  assert.strictEqual(match.guest.get('NET.phase'), 'playing');
+  const resumedTick = match.guest.get('G.tick');
+  match.run(0.25);
+  assert.ok(match.guest.get('G.tick') > resumedTick,
+    'the promoted authority should continue ticking rather than restart');
+  assert.strictEqual(match.guest.get('NET.round'), 1,
+    'seamless migration must preserve the round');
+  assert.strictEqual(match.guest.get('NET.authorityEpoch'), 2,
+    'the authority fence must still advance');
+  assert.strictEqual(match.guest.get('G.player.kills'), 11,
+    'scores must survive continued simulation');
+  assert.ok(match.guest.get('G.player.ammo') <= 7,
+    'ammo must continue from the restored magazine, never refill');
+});
+
+test('an event raced by normal flush and checkpoint replay is visible exactly once', () => {
+  const match = SIM.createMatch({ latencyMs: 5, seed: 4 });
+  match.run(0.3);
+  SIM.probeFeedback(match.guest);
+  const event = {
+    id: 44,
+    kind: 'damage',
+    target: SIM.HOST_ID,
+    from: SIM.GUEST_ID,
+    damage: 10,
+    head: false,
+    at: [0, 1, 0],
+    seq: null
+  };
+  match.guest.context.__wire = JSON.stringify({
+    t: 'event', v: SIM.NETP.VERSION,
+    authorityEpoch: 1, round: 1, events: [event]
+  });
+  match.guest.run('netHandleWire(__wire)');
+  assert.strictEqual(match.guest.get('__feedback.markers.length'), 1);
+
+  /* The same id can be replayed from the checkpoint under the new authority
+     epoch after its ordinary 30Hz flush won the race. */
+  match.guest.run('NET.authorityEpoch = 2;');
+  match.guest.context.__wire = JSON.stringify({
+    t: 'event', v: SIM.NETP.VERSION,
+    authorityEpoch: 2, round: 1, events: [event]
+  });
+  match.guest.run('netHandleWire(__wire)');
+  assert.strictEqual(match.guest.get('__feedback.markers.length'), 1,
+    'event id deduplication must span authority epochs');
+  assert.strictEqual(match.guest.get('NET.lastEventSeq'), 44);
+});
+
+test('a guest sees its own hit immediately instead of a round trip later', () => {
+  function feedbackDelayMs(predict) {
+    const match = SIM.createMatch({ latencyMs: LIVE_LATENCY_MS, seed: 5 });
+    match.run(1.0);
+    SIM.faceOff(match, { distance: 8 });
+    SIM.probeFeedback(match.guest);
+    if (!predict) SIM.disableHitPrediction(match.guest);
+
+    const firedAt = match.clock.ms;
+    match.guest.run('pressFire()');
+    match.run(1.0);
+
+    const markers = match.guest.get('__feedback.markers');
+    assert.ok(markers.length > 0, 'the guest should have registered a hit at all');
+    return { first: markers[0] - firedAt, count: markers.length };
+  }
+
+  const predicted = feedbackDelayMs(true);
+  const authoritative = feedbackDelayMs(false);
+
+  /* Measured: predicted 16.7ms (one tick), authoritative 233.3ms. */
+  assert.ok(predicted.first < 50,
+    `predicted feedback should be immediate, was ${predicted.first}ms`);
+  assert.ok(authoritative.first > 150,
+    `waiting for the host should cost most of a round trip, was ${authoritative.first}ms`);
+  assert.ok(authoritative.first - predicted.first > 120,
+    'prediction should remove the bulk of the wait');
+});
+
+test('an authoritative hit the guest already predicted is not shown twice', () => {
+  const match = SIM.createMatch({ latencyMs: LIVE_LATENCY_MS, seed: 5 });
+  match.run(1.0);
+  SIM.faceOff(match, { distance: 8 });
+  SIM.probeFeedback(match.guest);
+
+  match.guest.run('pressFire()');
+  match.run(0.4);
+  match.guest.run('releaseFire()');
+  /* Long enough for every authoritative answer to those shots to arrive. */
+  match.run(1.2);
+
+  const predicted = match.guest.get('__feedback.predicted').length;
+  const shown = match.guest.get('__feedback.markers').length;
+  assert.ok(predicted > 0, 'the guest should have predicted at least one hit');
+  assert.strictEqual(shown, predicted,
+    `every marker should come from prediction exactly once ` +
+    `(predicted ${predicted}, shown ${shown})`);
+});
+
+test('a guest can win a duel against an equally quick host', () => {
+  /* Both players track perfectly and draw a reaction time from the same
+     distribution, so an even split is what fairness would look like and every
+     departure from it is the netcode.
+
+     Was 100 / 0 at 96ms: a guest never won one. With input replay and per-tick
+     input it is about 63 / 37, ranging 54-75 across seeds at 24 trials. The
+     host keeps a real edge -- its damage lands in its own simulation while a
+     guest's has to cross the wire -- but the fight is winnable now.
+
+     The bound is wide deliberately. The upper end catches a regression back
+     toward saturation; the lower end catches the guest being handed an
+     advantage, which would be its own bug. */
+  const live = SIM.duelWinRate({ latencyMs: LIVE_LATENCY_MS, trials: 24, seed: 7 });
+
+  assert.strictEqual(live.tally.timeout, 0, 'every duel should resolve');
+  assert.ok(live.hostWinRate > 0.35,
+    `the host should still hold an edge, got ${(live.hostWinRate * 100).toFixed(0)}%`);
+  assert.ok(live.hostWinRate < 0.90,
+    `host should no longer dominate at ${LIVE_LATENCY_MS}ms, got ${(live.hostWinRate * 100).toFixed(0)}%`);
+  assert.ok(live.medianTtkMs > 200 && live.medianTtkMs < 2000,
+    `time-to-kill should be plausible, got ${live.medianTtkMs}ms`);
+});
+
+test('a guest predicts its own position to the centimetre', () => {
+  /* The mechanism behind everything above, and the one number that does not
+     saturate. The old blind damp pulled the local player 16% toward an
+     authoritative state a full round trip old, and that controller's fixed
+     point is e = -v*RTT: it converges on cancelling the prediction outright.
+
+     Measured while sprinting at 5.9m/s, before -> after:
+       5ms    0.038m -> 0.000m
+       48ms   0.191m -> 0.000m
+       96ms   0.421m -> 0.000m
+       150ms  0.720m -> 0.000m
+
+     At duel range 0.42m of positional error is a clean miss: the guest aims
+     from where it believes it is, and the host resolves that angle from
+     somewhere else. */
+  for (const latencyMs of [5, LIVE_LATENCY_MS]) {
+    const result = SIM.measurePredictionErrorM({ latencyMs: latencyMs, seed: 5, seconds: 4 });
+    assert.ok(result.samples > 50, `needed samples, got ${result.samples}`);
+    assert.ok(result.medianM < 0.05,
+      `prediction should converge at ${latencyMs}ms, got ${result.medianM.toFixed(3)}m`);
+  }
+});
+
+const REMOTE = "G.actors.find(a => a.controller === 'remote')";
+
+test('the host learns what a guest is honestly running at', () => {
+  const match = SIM.createMatch({ latencyMs: LIVE_LATENCY_MS, seed: 5 });
+  match.run(2.0);
+
+  const offset = match.host.get(`${REMOTE}.netLagOffset`);
+  assert.ok(Number.isFinite(offset), 'the host should have an estimate at all');
+
+  /* One way plus the guest's interpolation delay: 48ms of link plus roughly a
+     58ms buffer on a steady connection. The estimate has to land on that and
+     not on the 300ms the protocol would otherwise allow. */
+  assert.ok(offset > 0.06 && offset < 0.16,
+    `estimate should be one way plus interpolation, was ${offset.toFixed(3)}s`);
+  assert.ok(match.host.get(`${REMOTE}.netRelayRttMs`) > 0,
+    'the relay should have attested a round trip');
+});
+
+test('a guest cannot pick its own rewind point out of the whole window', () => {
+  const match = SIM.createMatch({ latencyMs: LIVE_LATENCY_MS, seed: 5 });
+  match.run(2.0);
+
+  const offset = match.host.get(`${REMOTE}.netLagOffset`);
+  const honest = match.host.get(`netNarrowRewind(${REMOTE}, G.time - ${offset})`);
+  const hostTime = match.host.get('G.time');
+  assert.ok(Math.abs((hostTime - honest) - offset) < 1e-9,
+    'a request already at the estimate should pass through untouched');
+
+  /* The two ends of the window the protocol alone would hand over: the
+     furthest back a backtracking cheat would reach for, and the newest instant
+     it could claim instead. Both come back held to the guest's own measured
+     lag, so the search space is the tolerance rather than the bound. */
+  for (const requested of [0.3, 0.0]) {
+    const narrowed = match.host.get(`netNarrowRewind(${REMOTE}, G.time - ${requested})`);
+    const applied = match.host.get('G.time') - narrowed;
+    assert.ok(Math.abs(applied - offset) <= 0.0305,
+      `a claimed ${requested}s rewind should be held near ${offset.toFixed(3)}s, ` +
+      `got ${applied.toFixed(3)}s`);
+  }
+});
+
+test('an unattested round trip still narrows to the guest\'s own history', () => {
+  /* An older relay sends no measurement. The ceiling falls back to the flat
+     protocol bound, which is the point at which the smoothed offset is the
+     only thing holding the request down — so it has to hold it on its own. */
+  const match = SIM.createMatch({ latencyMs: LIVE_LATENCY_MS, seed: 5 });
+  match.run(2.0);
+  match.host.run(`${REMOTE}.netRelayRttMs = 0;`);
+
+  const offset = match.host.get(`${REMOTE}.netLagOffset`);
+  const narrowed = match.host.get(`netNarrowRewind(${REMOTE}, G.time - 0.3)`);
+  const applied = match.host.get('G.time') - narrowed;
+  assert.ok(applied < 0.2, `should not reach the flat bound, got ${applied.toFixed(3)}s`);
+  assert.ok(Math.abs(applied - offset) <= 0.0305,
+    `should still sit near the estimate ${offset.toFixed(3)}s, got ${applied.toFixed(3)}s`);
+});
+
+test('a moving duel is not decided by the guest being dragged', () => {
+  /* A stationary duel cannot see reconciliation at all: standing still, a
+     mispredicted position costs nothing. Strafing, it costs everything --
+     before this work a guest could not win a strafing duel at 96ms given an
+     800ms head start, against 120ms standing still.
+
+     Handicap in ms at 5 / 48 / 96ms, before -> after:
+       stationary       40 / 80  / 120   ->  20 / 60 / 120
+       strafing 700ms   40 / 80  / >800  ->  20 / 60 / 120
+       strafing 1200ms  40 / 480 / >800  ->   0 /  0 /  20 */
+  const moving = SIM.guestHandicapMs({
+    latencyMs: LIVE_LATENCY_MS, seed: 7, strafePeriodMs: 700, maxHeadStartMs: 800
+  });
+  const still = SIM.guestHandicapMs({
+    latencyMs: LIVE_LATENCY_MS, seed: 7, strafePeriodMs: 0, maxHeadStartMs: 800
+  });
+
+  assert.ok(moving !== null,
+    'a strafing guest should be able to win at all, which it could not before');
+  assert.ok(moving <= still * 2,
+    `moving should not cost far more than standing still (moving ${moving}ms, still ${still}ms)`);
+});
+
+test('the guest\'s handicap grows with latency', () => {
+  /* Milliseconds of head start the guest needs before it stops losing.
+     Measured: 40ms at 5ms one-way, 80ms at 48ms, 120ms at 96ms.
+
+     This is the number to watch. The win rate saturates near 100% and stops
+     being able to show an improvement; the handicap keeps moving. */
+  const lan = SIM.guestHandicapMs({ latencyMs: 5, seed: 7 });
+  const live = SIM.guestHandicapMs({ latencyMs: LIVE_LATENCY_MS, seed: 7 });
+
+  assert.ok(lan !== null && live !== null, 'the guest should win given enough head start');
+  assert.ok(live > lan,
+    `handicap should grow with latency (${lan}ms at 5ms, ${live}ms at ${LIVE_LATENCY_MS}ms)`);
+  assert.ok(live >= 60,
+    `handicap at ${LIVE_LATENCY_MS}ms should be substantial, got ${live}ms`);
+});
+
+test('the guest renders other players in the past, but less than it used to', () => {
+  /* Measured against the host's own position history rather than derived from
+     the constants, so it reports what the renderer does.
+
+     A/B on this build: pinned back to the old flat two-interval buffer the
+     guest sees 100.0ms into the past; adaptive, 66.7ms. That 33ms is reaction
+     time the host was being given for free in every fight, and no amount of
+     lag compensation addresses it -- compensation fixes where your bullets
+     land, not when you first see someone. */
+  const view = SIM.measureViewLatencyMs({ latencyMs: LIVE_LATENCY_MS, seed: 5, seconds: 3 });
+  assert.ok(view.samples > 20, `needed usable samples, got ${view.samples}`);
+  assert.ok(view.medianMs > 30,
+    `the guest is necessarily behind the host's truth, got ${view.medianMs}ms`);
+
+  const OLD_FIXED_BUFFER_MS = 100;
+  assert.ok(view.medianMs < OLD_FIXED_BUFFER_MS,
+    `should beat the old flat ${OLD_FIXED_BUFFER_MS}ms buffer, got ${view.medianMs}ms`);
+
+  /* On a clean link the buffer should collapse toward its floor of one
+     interval plus a slim margin, not sit at the old two. */
+  const delayMs = view.match.guest.get('netInterpDelay()') * 1000;
+  assert.ok(delayMs > 50 && delayMs < 70,
+    `steady-link buffer should be near one interval, got ${delayMs}ms`);
+});
+
+test('the seam\'s move-normalize change is exact for keyboard input', () => {
+  /* 937e1ac replaced `if (ml > 1e-4) { normalize }` with `if (ml > 1) { clamp }`
+     in both stepPlayer and stepRemotePlayer, and argued the two are bit-for-bit
+     identical for keyboard play. Nothing could load src/70-game.js to check it,
+     so the claim shipped unverified. This checks it exhaustively.
+
+     The argument is that a key is either down or not, so every reachable
+     magnitude is 0, 1 or sqrt(2) -- and dividing by 1 is identity, which is the
+     only case where the two conditions disagree. That holds only if
+     readLocalInput really does emit nothing else, which is the part worth
+     testing rather than reasoning about. */
+  const instance = SIM.createInstance({ ms: 0 });
+  const KEYS = ['KeyW', 'KeyA', 'KeyS', 'KeyD'];
+
+  for (let mask = 0; mask < 16; mask++) {
+    instance.run('KEY.KeyW = KEY.KeyA = KEY.KeyS = KEY.KeyD = false;');
+    const held = KEYS.filter((_, bit) => mask & (1 << bit));
+    for (const key of held) instance.run(`KEY.${key} = true;`);
+
+    const input = instance.run('readLocalInput(true)');
+    const ml = Math.hypot(input.fwd, input.strafe);
+
+    const reachable = Math.abs(ml) < 1e-12 ||
+      Math.abs(ml - 1) < 1e-12 ||
+      Math.abs(ml - Math.SQRT2) < 1e-12;
+    assert.ok(reachable,
+      `keyboard should only ever produce 0, 1 or sqrt(2), got ${ml} for [${held}]`);
+
+    /* Both formulas, applied to the same vector. */
+    const oldWay = { x: input.strafe, z: input.fwd };
+    if (ml > 1e-4) { oldWay.x /= ml; oldWay.z /= ml; }
+    const newWay = { x: input.strafe, z: input.fwd };
+    if (ml > 1) { newWay.x /= ml; newWay.z /= ml; }
+
+    assert.strictEqual(newWay.x, oldWay.x, `strafe differs for [${held}]`);
+    assert.strictEqual(newWay.z, oldWay.z, `forward differs for [${held}]`);
+  }
+});
+
+test('neither peer outruns the relay\'s message budget', () => {
+  /* server.mjs closes a peer that exceeds ratePerSecond (90). Sending input
+     once per simulated tick puts a guest at 60/s, which is comfortable but no
+     longer negligible -- and the failure mode is a closed socket that reads as
+     a random disconnect rather than as a rate limit. Worth a guard.
+
+     Measured: guest 60.0/s, host 27.0/s. */
+  const BUDGET = 90;
+  const seconds = 4;
+  const match = SIM.createMatch({
+    latencyMs: LIVE_LATENCY_MS, seed: 5, combatants: 9
+  });
+  match.run(1.0);
+
+  const before = { guest: match.link.stats.fromGuest, host: match.link.stats.fromHost };
+  match.guest.run('KEY.KeyW = true; pressFire();');
+  match.host.run('KEY.KeyW = true; pressFire();');
+  match.run(seconds);
+
+  const guestRate = (match.link.stats.fromGuest - before.guest) / seconds;
+  const hostRate = (match.link.stats.fromHost - before.host) / seconds;
+
+  assert.ok(guestRate < BUDGET, `guest sends ${guestRate}/s against a ${BUDGET}/s budget`);
+  assert.ok(hostRate < BUDGET, `host sends ${hostRate}/s against a ${BUDGET}/s budget`);
+  const migrationBytes = Buffer.byteLength(JSON.stringify({
+    snapshot: match.link.latestSnapshot(),
+    checkpoint: match.link.latestCheckpoint()
+  }));
+  assert.ok(migrationBytes < SIM.NETP.MAX_MESSAGE_BYTES,
+    `cached migration state is ${migrationBytes} bytes against a ` +
+    `${SIM.NETP.MAX_MESSAGE_BYTES}-byte message limit`);
+});
+
+/* ---------------------------------------------------------------------
+   Matchmaking
+
+   These drive the real client's matchmaking functions in a bare instance --
+   no link, no match. The point is that the decisions PLAY makes on the
+   player's behalf are decisions the repo can check, rather than something
+   that only ever ran in a browser nobody was measuring.
+   --------------------------------------------------------------------- */
+
+function matchmakingClient() {
+  return SIM.createInstance({ ms: 0 });
+}
+
+/* A client whose clock the test drives and whose DOM writes it can read back:
+   the harness hands out a fresh stub per getElementById call, so a countdown
+   that only exists as text on a button is otherwise invisible. */
+function countdownClient() {
+  const clock = { ms: 0 };
+  const client = SIM.createInstance(clock);
+  client.run(`
+    var SIM_ELS = new Map();
+    document.getElementById = function (id) {
+      if (!SIM_ELS.has(id)) SIM_ELS.set(id, {
+        id: id, textContent: '', hidden: false, disabled: false, dataset: {},
+        classList: { add() {}, remove() {}, toggle() {}, contains: () => false },
+        addEventListener() {}, appendChild(child) { return child; }, innerHTML: ''
+      });
+      return SIM_ELS.get(id);
+    };
+  `);
+  client.advance = (ms) => { clock.ms += ms; };
+  client.text = (id) => client.get(`document.getElementById(${JSON.stringify(id)}).textContent`);
+  client.hidden = (id) => client.get(`document.getElementById(${JSON.stringify(id)}).hidden`);
+  return client;
+}
+
+test('quick play offers the busiest room with a seat free', () => {
+  const client = matchmakingClient();
+  const pick = (rooms) =>
+    client.run(`netQuickCandidates(${JSON.stringify(rooms)})`);
+
+  assert.deepEqual(pick([
+    { code: 'AAAAAA', host: 'A', players: 1, max: 4, inProgress: false },
+    { code: 'BBBBBB', host: 'B', players: 3, max: 4, inProgress: false },
+    { code: 'CCCCCC', host: 'C', players: 2, max: 4, inProgress: false }
+  ]), ['BBBBBB', 'CCCCCC', 'AAAAAA'],
+  'a thin population belongs in one match, so the fullest room goes first');
+
+  assert.deepEqual(pick([
+    { code: 'AAAAAA', host: 'A', players: 3, max: 4, inProgress: true },
+    { code: 'BBBBBB', host: 'B', players: 4, max: 4, inProgress: true },
+    { code: 'CCCCCC', host: 'C', players: 1, max: 4, inProgress: false }
+  ]), ['AAAAAA', 'CCCCCC'],
+  'a running room with a seat is the better answer to PLAY, not the worse one');
+
+  assert.deepEqual(pick([]), [], 'nothing to join is answered by hosting');
+  assert.deepEqual(pick(null), [], 'an unreachable browser is not a crash');
+});
+
+/* The clock itself belongs to the relay, and net-protocol.test.js tests it
+   there. What is left in the page is a display, so what is worth asserting
+   here is that it displays the relay's number and starts nothing of its own. */
+test('the lobby countdown shows the relay\'s clock and starts nothing itself', () => {
+  const client = countdownClient();
+  const shown = () => client.text('countdownText');
+  client.run(`
+    var SIM_STARTS = 0;
+    netHostStart = function () { SIM_STARTS++; };
+    NET.mode = 'host';
+    NET.phase = 'lobby';
+    NET.members = [
+      { id: 'a', name: 'A', role: 'host' },
+      { id: 'b', name: 'B', role: 'guest' }
+    ];
+  `);
+
+  try {
+    client.run('netUpdateAutoStart(null);');
+    assert.strictEqual(client.get('NET.countdownTimer'), 0,
+      'a room the relay is not counting shows no clock');
+    assert.strictEqual(client.hidden('lobbyCountdown'), true);
+
+    client.run('netUpdateAutoStart(5000);');
+    assert.strictEqual(shown(), 'Starting in 5…', 'the relay says five, the page says five');
+    assert.strictEqual(client.hidden('holdStart'), false,
+      'and the host is offered the deferral');
+
+    /* Wall-clock, not tick-counting: a throttled tab that missed three
+       quarters of its ticks still shows the right number when it wakes. */
+    client.advance(3200);
+    client.run('netTickAutoStart();');
+    assert.strictEqual(shown(), 'Starting in 2…');
+
+    client.advance(2000);
+    client.run('netTickAutoStart();');
+    assert.strictEqual(shown(), 'Starting in 0…', 'it runs out rather than going negative');
+    assert.strictEqual(client.get('SIM_STARTS'), 0,
+      'and reaching zero starts nothing: that is the relay\'s call, not this page\'s');
+
+    /* A roster change re-syncs to whatever the relay now says, in either
+       direction — a HOLD granted by the relay arrives exactly this way. */
+    client.run('netUpdateAutoStart(30000);');
+    assert.strictEqual(shown(), 'Starting in 30…');
+  } finally {
+    client.run('netCancelAutoStart();');
+  }
+});
+
+test('a guest sees the same clock as the host', () => {
+  const client = countdownClient();
+  client.run(`
+    var SIM_STARTS = 0;
+    netHostStart = function () { SIM_STARTS++; };
+    NET.mode = 'guest';
+    NET.phase = 'lobby';
+    NET.members = [
+      { id: 'a', name: 'A', role: 'host' },
+      { id: 'b', name: 'B', role: 'guest' }
+    ];
+    netUpdateAutoStart(5000);
+  `);
+
+  try {
+    /* A guest used to be told the rule and left to trust it. It gets the
+       number now — the same number, off the same clock. */
+    assert.strictEqual(client.text('countdownText'), 'Starting in 5…');
+    assert.strictEqual(client.hidden('holdStart'), true,
+      'but only the host may push it back');
+    assert.strictEqual(client.get('SIM_STARTS'), 0,
+      'and only the authority starts a round');
+  } finally {
+    client.run('netCancelAutoStart();');
+  }
+});
+
+test('between rounds the clock lands on the rematch button', () => {
+  const client = countdownClient();
+  const label = () => client.text('again');
+  client.run(`
+    NET.mode = 'guest';
+    NET.phase = 'playing';
+    G.over = true;
+    NET.members = [
+      { id: 'a', name: 'A', role: 'host' },
+      { id: 'b', name: 'B', role: 'guest' }
+    ];
+    netUpdateAutoStart(12000);
+  `);
+
+  try {
+    assert.strictEqual(label(), 'REMATCH IN 12',
+      'a scoreboard is the whole screen, so the clock goes on the button that is on it');
+    client.run("NET.mode = 'host'; netTickAutoStart();");
+    assert.strictEqual(label(), 'START REMATCH (12)',
+      'the host is told it can skip the wait');
+
+    client.run("NET.starting = true; netTickAutoStart();");
+    assert.strictEqual(label(), 'START REMATCH (12)',
+      'a start already in flight owns the label; a countdown must not talk over it');
+
+    /* The round beginning is what stops it — the same call netBeginMatch makes. */
+    client.run("NET.starting = false; G.over = false; netTickAutoStart();");
+    assert.strictEqual(client.get('NET.countdownTimer'), 0);
+  } finally {
+    client.run('netCancelAutoStart();');
+  }
+});
+
+/* ---------------------------------------------------------------------
+   Drop-in
+
+   The claim worth testing is that seating a player mid-round needs no new
+   message: the host adds an actor and bumps the manifest, and the existing
+   snapshot stream carries it to everyone. These run against the real client
+   in a real host/guest match rather than a stub of one.
+   --------------------------------------------------------------------- */
+
+const LATE_ID = 'late-0001';
+/* Slot 2 is the seat the relay would hand out next: the fixture's two humans
+   hold 0 and 1, so a bot is wearing this jersey and has to give it up. */
+const ARRIVE = `
+  NET.members.push(
+    { id: '${LATE_ID}', name: 'Latecomer', role: 'guest', slot: 2 });
+  netAdmitArrivals();
+`;
+
+test('a player who drops in takes a bot\'s slot rather than a spare one', () => {
+  const match = SIM.createMatch({ latencyMs: LIVE_LATENCY_MS, seed: 5, combatants: 9 });
+  match.run(1.0);
+
+  const bots = () => match.host.get("G.actors.filter(a => a.controller === 'bot').length");
+  const before = {
+    actors: match.host.get('G.actors.length'),
+    bots: bots(),
+    manifest: match.host.get('NET.manifestVersion')
+  };
+  assert.ok(before.bots > 0, 'the fixture needs a bot to give up');
+
+  match.host.run(ARRIVE);
+
+  assert.strictEqual(match.host.get('G.actors.length'), before.actors,
+    'a match people are already playing does not quietly get busier');
+  assert.strictEqual(bots(), before.bots - 1, 'a bot paid for the seat');
+  assert.ok(match.host.get('NET.manifestVersion') > before.manifest,
+    'and the roster change is versioned, which is what guests key off');
+
+  const seated = (field) =>
+    match.host.get(`G.actors.find(a => a.netId === '${LATE_ID}').${field}`);
+  assert.strictEqual(seated('controller'), 'remote');
+  assert.strictEqual(seated('isHuman'), true);
+  assert.ok(seated('shield') > 0,
+    'walking into a live firefight with no shield is the one way this is worse than waiting');
+  assert.strictEqual(seated('alive'), true);
+});
+
+test('the arrival reaches a guest on the ordinary snapshot stream', () => {
+  const match = SIM.createMatch({ latencyMs: LIVE_LATENCY_MS, seed: 5, combatants: 9 });
+  match.run(1.0);
+
+  assert.strictEqual(match.guest.get(`!!G.actors.find(a => a.netId === '${LATE_ID}')`), false);
+  match.host.run(ARRIVE);
+  match.run(0.6);
+
+  assert.strictEqual(match.guest.get(`!!G.actors.find(a => a.netId === '${LATE_ID}')`), true,
+    'no new message type was needed — the manifest bump carried it');
+  /* Everything a guest does not drive is a 'replica'; `isHuman` is what says
+     there is a person behind it, and it is what the killfeed reads. */
+  assert.strictEqual(
+    match.guest.get(`G.actors.find(a => a.netId === '${LATE_ID}').isHuman`), true,
+    'and the guest knows it is a person, not a bot');
+  assert.strictEqual(match.link.stats.staleEpoch, 0);
+});
+
+test('nobody ends up dressed as anybody else', () => {
+  const match = SIM.createMatch({ latencyMs: LIVE_LATENCY_MS, seed: 5, combatants: 9 });
+  match.run(1.0);
+
+  const jerseys = () => match.host.get('G.actors.map(a => a.colors.name)');
+  const before = jerseys();
+  assert.strictEqual(new Set(before).size, before.length,
+    'nine combatants, nine jerseys, before anyone drops in');
+  /* Slot 2 is a bot right now, and that specific bot is the one that pays —
+     not whichever bot is doing worst, which is what would leave the arrival
+     wearing a colour somebody on the map still has on. */
+  assert.ok(before.includes('Sherbet'), 'the fixture needs slot 2 occupied');
+
+  match.host.run(ARRIVE);
+
+  const after = jerseys();
+  assert.strictEqual(new Set(after).size, after.length,
+    'and nine again afterwards: the arrival took a jersey, it did not copy one');
+  assert.strictEqual(
+    match.host.get(`G.actors.find(a => a.netId === '${LATE_ID}').colors.name`),
+    'Sherbet', 'the arrival wears the seat the relay reserved for it');
+  assert.strictEqual(
+    match.host.get("G.actors.filter(a => a.colors.name === 'Sherbet').length"), 1,
+    'and the bot that was wearing it is the bot that left');
+});
+
+test('bots come back when the people they stood aside for leave', () => {
+  const match = SIM.createMatch({ latencyMs: LIVE_LATENCY_MS, seed: 5, combatants: 9 });
+  match.run(1.0);
+  match.host.run(ARRIVE);
+
+  const bots = () => match.host.get("G.actors.filter(a => a.controller === 'bot').length");
+  const seated = bots();
+
+  /* Both guests go: the roster the host is handed no longer has them on it,
+     which is the only signal a departure ever gives. */
+  match.host.run(`
+    NET.members = NET.members.filter(m => m.id === NET.id);
+    netPruneDepartedPlayers();
+  `);
+
+  assert.strictEqual(match.host.get('G.actors.length'), 9,
+    'a match that lost two players is still a match, not a two-handed one');
+  assert.strictEqual(bots(), seated + 2, 'the seats went back to bots');
+  const jerseys = match.host.get('G.actors.map(a => a.colors.name)');
+  assert.strictEqual(new Set(jerseys).size, 9,
+    'wearing the jerseys the leavers gave back, not copies of one still worn');
+  assert.strictEqual(
+    match.host.get("G.actors.filter(a => !a.alive).length"), 0,
+    'and standing on spawns rather than wherever they were constructed');
+});
+
+test('a room of nine real players is built with no bots in it at all', () => {
+  const client = SIM.createInstance({ ms: 0 });
+  const roster = Array.from({ length: 9 }, (unused, slot) => ({
+    id: `p-${slot}`, name: `PLAYER${slot}`,
+    role: slot === 0 ? 'host' : 'guest', slot: slot
+  }));
+
+  client.run(`
+    initViewmodel(); initFX(); initInput(); initAI();
+    NET.mode = 'host';
+    NET.id = 'p-0';
+    NET.members = ${JSON.stringify(roster)};
+    setupMatch();
+  `);
+
+  assert.strictEqual(client.get('G.actors.length'), 9);
+  assert.strictEqual(client.get("G.actors.filter(a => a.controller === 'bot').length"), 0,
+    'the whole point: a full room is nine people, and the bots are simply never made');
+  assert.strictEqual(client.get('G.actors.filter(a => a.isHuman).length'), 9);
+  assert.strictEqual(client.get('new Set(G.actors.map(a => a.colors.name)).size'), 9,
+    'nine real players still get nine distinguishable jerseys');
+});
+
+test('a decided round seats nobody', () => {
+  const match = SIM.createMatch({ latencyMs: LIVE_LATENCY_MS, seed: 5, combatants: 9 });
+  match.run(1.0);
+
+  /* Scores are final and the host is about to put the room back in the
+     lobby; dropping someone into that is a worse welcome than the wait. */
+  match.host.run('G.over = true;');
+  const before = match.host.get('G.actors.length');
+  match.host.run(ARRIVE);
+
+  assert.strictEqual(match.host.get('G.actors.length'), before);
+  assert.strictEqual(match.host.get(`!!G.actors.find(a => a.netId === '${LATE_ID}')`), false);
+});
+
+test('the deploy card a drop-in lands on can actually be clicked', () => {
+  const client = SIM.createInstance({ ms: 0 });
+
+  /* The harness hands back a fresh stub per getElementById call, so DOM state
+     is invisible by default. Memoise it for this test: the regression being
+     guarded is entirely about the state left on one button. */
+  client.run(`
+    var SIM_ELS = new Map();
+    document.getElementById = function (id) {
+      if (!SIM_ELS.has(id)) SIM_ELS.set(id, {
+        id: id, textContent: '', hidden: false, disabled: false, dataset: {},
+        classList: { add() {}, remove() {}, toggle() {}, contains: () => false },
+        addEventListener() {}, appendChild(child) { return child; }, innerHTML: ''
+      });
+      return SIM_ELS.get(id);
+    };
+    startMatch = function () { G.started = true; };
+    setPaused = function () {};
+    showHint = function () {};
+    NET.mode = 'guest';
+    NET.id = 'late-0001';
+    NET.room = 'ABCDEF';
+    NET.members = [
+      { id: 'host-0001', name: 'Host', role: 'host', slot: 0 },
+      { id: 'late-0001', name: 'Latecomer', role: 'guest', slot: 1 }
+    ];
+  `);
+
+  /* netConnect disables these while it dials. A player who joins a lobby gets
+     them back when the lobby renders; a drop-in never sees a lobby. */
+  client.run('netSetMenuBusy(true); netBeginMatch();');
+
+  assert.strictEqual(client.get("SIM_ELS.get('play').textContent"), 'ENTER MATCH');
+  assert.strictEqual(client.get("SIM_ELS.get('play').disabled"), false,
+    'a deploy card nobody can click is a player frozen at the door');
+});
+
+/* ---------------------------------------------------------------------
+   Killcam
+
+   These drive killcamActor() directly. The per-frame clock that advances
+   KILLCAM.t lives in updateCamera, which is in src/90-main.js and therefore
+   outside this harness by design (see FILES in net-sim.js) -- so the tests
+   set the elapsed time themselves and assert the decision, which is where
+   every fallback lives. What is being guarded is that three seconds is long
+   enough for the thing you are looking through to stop existing.
+   --------------------------------------------------------------------- */
+
+function killcamMatch() {
+  const match = SIM.createMatch({ latencyMs: 0, seed: 5 });
+  match.host.run('showHint = function () {};');
+  return match;
+}
+
+/* Past the opening hold, so the decision under test is the fallback and not
+   the deliberate delay before the cut. */
+function killcamHeld(client) {
+  client.run('KILLCAM.t = KILLCAM_HOLD;');
+}
+
+test('the killcam looks through whoever killed you', () => {
+  const match = killcamMatch();
+  match.host.run('killActor(G.player, G.actors[1]);');
+  killcamHeld(match.host);
+
+  assert.strictEqual(match.host.get('killcamActor() === G.actors[1]'), true);
+});
+
+test('the killcam holds on the death cam before it cuts', () => {
+  const match = killcamMatch();
+  match.host.run('killActor(G.player, G.actors[1]);');
+
+  assert.strictEqual(match.host.get('KILLCAM.t'), 0);
+  assert.strictEqual(match.host.get('killcamActor()'), null,
+    'cutting on the same frame as the kill burst reads as a glitch');
+
+  match.host.run('KILLCAM.t = KILLCAM_HOLD - 0.01;');
+  assert.strictEqual(match.host.get('killcamActor()'), null);
+  killcamHeld(match.host);
+  assert.notStrictEqual(match.host.get('killcamActor()'), null);
+});
+
+test('a death with nobody to credit stays on the death cam', () => {
+  const match = killcamMatch();
+  match.host.run('killActor(G.player, null);');
+  killcamHeld(match.host);
+
+  assert.strictEqual(match.host.get('KILLCAM.killer'), null);
+  assert.strictEqual(match.host.get('killcamActor()'), null);
+});
+
+test('you are never handed a killcam through your own eyes', () => {
+  const match = killcamMatch();
+  match.host.run('killActor(G.player, G.player);');
+  killcamHeld(match.host);
+
+  assert.strictEqual(match.host.get('KILLCAM.killer'), null);
+  assert.strictEqual(match.host.get('killcamActor()'), null);
+});
+
+test('a killer who leaves the room mid-killcam drops the view, not the frame', () => {
+  const match = killcamMatch();
+  match.host.run('killActor(G.player, G.actors[1]);');
+  killcamHeld(match.host);
+  assert.notStrictEqual(match.host.get('killcamActor()'), null);
+
+  /* The reference the killcam holds outlives the roster it came from: a guest
+     that disconnects is spliced out of G.actors by netPruneDepartedPlayers. */
+  match.host.run('detachActor(G.actors[1]);');
+  assert.strictEqual(match.host.get('killcamActor()'), null);
+});
+
+test('a killer who dies mid-killcam drops the view rather than ride the corpse', () => {
+  const match = killcamMatch();
+  match.host.run('killActor(G.player, G.actors[1]);');
+  killcamHeld(match.host);
+  assert.notStrictEqual(match.host.get('killcamActor()'), null);
+
+  match.host.run('killActor(G.actors[1], G.actors[2]);');
+  assert.strictEqual(match.host.get('killcamActor()'), null);
+});
+
+test('the killcam gives the camera back when the match ends', () => {
+  const match = killcamMatch();
+  match.host.run('killActor(G.player, G.actors[1]);');
+  killcamHeld(match.host);
+
+  match.host.run('G.over = true;');
+  assert.strictEqual(match.host.get('killcamActor()'), null,
+    'endMatch hides the death card without going through hideDeadScreen');
+});
+
+test('respawning ends the killcam and puts the hidden body back', () => {
+  const match = killcamMatch();
+  match.host.run('killActor(G.player, G.actors[1]);');
+  killcamHeld(match.host);
+  match.host.run('killcamShow(killcamActor());');
+  assert.strictEqual(match.host.get('KILLCAM.shown === G.actors[1]'), true);
+
+  match.host.run('hideDeadScreen();');
+  assert.strictEqual(match.host.get('KILLCAM.killer'), null);
+  assert.strictEqual(match.host.get('KILLCAM.shown'), null,
+    'a body hidden to look through it has to come back');
+});
+
+test('killcamShow always restores the actor it hid, not the one it meant to', () => {
+  const match = killcamMatch();
+  match.host.run('killcamShow(G.actors[1]);');
+  assert.strictEqual(match.host.get('KILLCAM.shown === G.actors[1]'), true);
+
+  /* Falling back mid-window swaps the target; the previous body is the one
+     owed a restore, and pairing hide with restore is the whole point of
+     routing both through one function. */
+  match.host.run('killcamShow(G.actors[2]);');
+  assert.strictEqual(match.host.get('KILLCAM.shown === G.actors[2]'), true);
+  match.host.run('killcamShow(null);');
+  assert.strictEqual(match.host.get('KILLCAM.shown'), null);
+});
+
+test('rebuilding the match drops the killcam reference to the old roster', () => {
+  const match = killcamMatch();
+  match.host.run('killActor(G.player, G.actors[1]);');
+  killcamHeld(match.host);
+  match.host.run('killcamShow(killcamActor());');
+
+  match.host.run('setupMatch();');
+  assert.strictEqual(match.host.get('KILLCAM.killer'), null);
+  assert.strictEqual(match.host.get('KILLCAM.shown'), null,
+    'a discarded actor held here is a discarded actor kept alive');
+});
+
+test('the weapon card follows the killcam to the gun on screen', () => {
+  const match = killcamMatch();
+  match.host.run(`
+    G.player.weapon = 'smg'; G.player.ammo = 7; G.player.reserve = 21;
+    G.actors[1].weapon = 'rifle'; G.actors[1].ammo = 4; G.actors[1].reserve = 40;
+    updateHUD();
+  `);
+  assert.strictEqual(match.host.get('elWName.textContent'), 'BUBBLEGUN');
+  assert.match(match.host.get('elAmmo.innerHTML'), /^7</);
+
+  match.host.run('killActor(G.player, G.actors[1]);');
+  killcamHeld(match.host);
+  match.host.run('killcamShow(killcamActor()); updateHUD();');
+
+  assert.strictEqual(match.host.get('elWName.textContent'), 'LOLLIPOP',
+    'a card counting your own magazine contradicts the gun being drawn');
+  assert.match(match.host.get('elAmmo.innerHTML'), /^4</);
+});
+
+test('the killcam weapon card names its owner instead of telling you to reload', () => {
+  const match = killcamMatch();
+  match.host.run(`
+    G.actors[1].weapon = 'rifle'; G.actors[1].ammo = 0; G.actors[1].reserve = 40;
+    killActor(G.player, G.actors[1]);
+  `);
+  killcamHeld(match.host);
+  match.host.run('killcamShow(killcamActor()); updateHUD();');
+
+  const caption = match.host.get('elReload.textContent');
+  assert.notStrictEqual(caption, 'PRESS R',
+    'there is nothing the player can do about somebody else\'s empty magazine');
+  assert.strictEqual(caption, match.host.get('G.actors[1].name'));
+});
+
+test('the weapon card comes back to your own gun when the killcam ends', () => {
+  const match = killcamMatch();
+  match.host.run(`
+    G.player.weapon = 'shotgun'; G.player.ammo = 5; G.player.reserve = 30;
+    G.actors[1].weapon = 'rifle';
+    killActor(G.player, G.actors[1]);
+  `);
+  killcamHeld(match.host);
+  match.host.run('killcamShow(killcamActor()); updateHUD();');
+  assert.strictEqual(match.host.get('elWName.textContent'), 'LOLLIPOP');
+
+  match.host.run('hideDeadScreen(); updateHUD();');
+  assert.strictEqual(match.host.get('elWName.textContent'), 'MARSHMALLOW');
+  assert.match(match.host.get('elAmmo.innerHTML'), /^5</);
+});
+
+/* ---------------------------------------------------------------------
+   Getting out
+
+   The match-over card used to carry a REMATCH button and nothing else, and
+   setPaused returns early once G.over is set — so every other route to the
+   title was closed too, including the pointerlockchange that endMatch's own
+   exitPointerLock triggers. A finished match could only be left by reloading
+   the page, and a guest, whose REMATCH reads WAITING FOR HOST and is
+   disabled, had nothing on the screen it could press at all.
+
+   These run against the real handlers rather than a restatement of them: the
+   DOM below remembers class and button state, and Escape is delivered to the
+   listener initInput actually registered.
+   --------------------------------------------------------------------- */
+function menuClient() {
+  const client = SIM.createInstance({ ms: 0 });
+  client.run(`
+    var SIM_ELS = new Map();
+    var SIM_KEYDOWN = [];
+    var SIM_TIMERS = [];
+    document.getElementById = function (id) {
+      if (!SIM_ELS.has(id)) {
+        /* The three cards the page ships closed. #rooms belongs here for the
+           same reason the other two do: roomsIsOpen reads this class, and a
+           browser that has not opened the room browser must not look to the
+           Escape chain like one that has. */
+        var classes = new Set(
+          id === 'over' || id === 'dead' || id === 'rooms' ? ['off'] : []);
+        SIM_ELS.set(id, {
+          id: id, textContent: '', innerHTML: '', value: '', hidden: false,
+          disabled: false, checked: false, dataset: {}, children: [], style: {},
+          classList: {
+            add: function (c) { classes.add(c); },
+            remove: function (c) { classes['delete'](c); },
+            toggle: function (c, on) { on ? classes.add(c) : classes['delete'](c); },
+            contains: function (c) { return classes.has(c); }
+          },
+          addEventListener: function () {},
+          appendChild: function (c) { return c; },
+          insertBefore: function (c) { return c; },
+          querySelectorAll: function () { return []; },
+          setAttribute: function () {}, getAttribute: function () { return null; }
+        });
+      }
+      return SIM_ELS.get(id);
+    };
+    addEventListener = function (type, fn) { if (type === 'keydown') SIM_KEYDOWN.push(fn); };
+    setTimeout = function (fn, ms) { SIM_TIMERS.push({ fn: fn, ms: ms }); return SIM_TIMERS.length; };
+    clearTimeout = function () {};
+    initInput();
+    function simEscape() {
+      for (var i = 0; i < SIM_KEYDOWN.length; i++) {
+        SIM_KEYDOWN[i]({ code: 'Escape', repeat: false, preventDefault: function () {} });
+      }
+    }
+    function simFireTimer(ms) {
+      for (var i = 0; i < SIM_TIMERS.length; i++) {
+        if (SIM_TIMERS[i].ms === ms) { SIM_TIMERS[i].fn(); return true; }
+      }
+      return false;
+    }
+  `);
+  const ref = (id) => `document.getElementById(${JSON.stringify(id)})`;
+  client.text = (id) => client.get(`${ref(id)}.textContent`);
+  client.disabled = (id) => client.get(`${ref(id)}.disabled`);
+  client.has = (id, cls) => client.get(`${ref(id)}.classList.contains(${JSON.stringify(cls)})`);
+  return client;
+}
+
+test('a finished match has a way back to the menu', () => {
+  const client = menuClient();
+  client.run(`
+    G.started = true; G.over = true;
+    document.getElementById('title').classList.add('off');
+    document.getElementById('over').classList.remove('off');
+    document.getElementById('again').textContent = 'WAITING FOR HOST';
+    document.getElementById('again').disabled = true;
+    returnToMenu();
+  `);
+
+  assert.strictEqual(client.has('title', 'off'), false, 'the title card is the way back');
+  assert.strictEqual(client.has('over', 'off'), true, 'and the card you left is down');
+  assert.strictEqual(client.has('hud', 'hide'), true);
+  assert.strictEqual(client.get('G.over'), false);
+  assert.strictEqual(client.get('G.started'), false);
+  /* Whatever the last round left on the button must not greet the next one. */
+  assert.strictEqual(client.text('again'), 'REMATCH');
+  assert.strictEqual(client.disabled('again'), false);
+});
+
+test('Escape resolves to something at every point in a match', () => {
+  const client = menuClient();
+
+  client.run('G.started = true; G.over = false; G.paused = false; simEscape();');
+  assert.strictEqual(client.get('G.paused'), true, 'a running match pauses');
+
+  client.run('simEscape();');
+  assert.strictEqual(client.get('G.paused'), false, 'a paused one resumes');
+
+  /* The case that had no route at all: endMatch releases the pointer lock
+     itself, so the pointerlockchange that used to stand in for this key never
+     fires, and setPaused refuses to run on G.over regardless. */
+  client.run('G.over = true; simEscape();');
+  assert.strictEqual(client.get('G.started'), false, 'a finished one leaves');
+  assert.strictEqual(client.has('title', 'off'), false);
+});
+
+test('a guest is never left with nothing it can press', () => {
+  const client = menuClient();
+  client.run(`
+    NET.mode = 'guest'; NET.phase = 'playing';
+    G.started = true; G.over = true;
+    netSyncRematchButton();
+  `);
+
+  assert.strictEqual(client.disabled('again'), true,
+    'only a host may start a rematch, so that button stays honest');
+  assert.strictEqual(client.disabled('overMenu'), false,
+    'which is the whole reason the card carries a second one');
+
+  client.run('netLeaveMatch();');
+  assert.strictEqual(client.has('title', 'off'), false);
+  assert.strictEqual(client.get('NET.mode'), 'solo', 'and leaving hands the seat back');
+  assert.strictEqual(client.get('NET.phase'), 'idle');
+});
+
+test('a start the relay never answers gives the button back', () => {
+  const client = menuClient();
+  client.run(`
+    NET.mode = 'host'; NET.phase = 'playing';
+    G.started = true; G.over = true;
+    netSend = function () { return true; };
+    netHostStart();
+  `);
+
+  assert.strictEqual(client.get('NET.starting'), true);
+  assert.strictEqual(client.text('again'), 'STARTING…');
+  assert.strictEqual(client.disabled('again'), true);
+
+  /* Nothing comes back. That used to be the end of it: a disabled button, on
+     a card with no other control on it, in a room that was working fine. */
+  assert.strictEqual(client.run('simFireTimer(NET_START_TIMEOUT)'), true);
+  assert.strictEqual(client.get('NET.starting'), false);
+  assert.strictEqual(client.text('again'), 'START REMATCH');
+  assert.strictEqual(client.disabled('again'), false);
+});
+
+test('a network call in flight cannot take RESUME away', () => {
+  const client = menuClient();
+  client.run('G.started = true; G.paused = true; netSetMenuBusy(true);');
+  assert.strictEqual(client.disabled('play'), false,
+    'resuming is local, and a relay that is not answering has no say in it');
+  assert.strictEqual(client.disabled('quickPlay'), true,
+    'the buttons that do need the relay still wait for it');
+
+  client.run('G.started = false; netSetMenuBusy(true);');
+  assert.strictEqual(client.disabled('play'), true,
+    'back on the title card it is SOLO again, and busy means busy');
+});
+
+test('the room browser opens and closes, and owns Escape while it is up', () => {
+  const client = menuClient();
+  /* netRefreshRooms runs on open and there is no relay behind the sim, so
+     opening has to survive it failing. */
+  client.run(`netRefreshRooms = function () {};`);
+
+  assert.strictEqual(client.has('rooms', 'off'), true, 'the page ships it closed');
+
+  client.run('roomsShow(true);');
+  assert.strictEqual(client.has('rooms', 'off'), false);
+
+  /* The interaction this guard exists for: 70-game.js takes Escape on a
+     listener registered long before 75-network.js registers the dialog's, so
+     without it the key would pause the match underneath a browser that is
+     still on screen. Only the guard is exercised here — the listener that
+     does the closing is wired by initNetworkUI, which this harness does not
+     run — so the dialog is closed by hand below. */
+  client.run('G.started = true; G.over = false; G.paused = false; simEscape();');
+  assert.strictEqual(client.get('G.paused'), false,
+    'Escape belongs to the dialog while the dialog is up');
+
+  client.run('roomsShow(false);');
+  assert.strictEqual(client.has('rooms', 'off'), true);
+
+  /* And once it is down the key goes back to the match. */
+  client.run('simEscape();');
+  assert.strictEqual(client.get('G.paused'), true);
+});
+
+test('joining from the room browser puts the browser away first', () => {
+  const client = menuClient();
+  /* The rows are built by netRenderRooms out of document.createElement, and
+     the harness's elements record neither children nor listeners — so this
+     test brings its own, and then presses the button the player presses
+     rather than a restatement of what it does. */
+  client.run(`
+    netRefreshRooms = function () {};
+    netConnect = function (mode, code) { NET.simConnect = mode + ':' + (code || ''); };
+    var SIM_ROWS = [];
+    document.createElement = function (tag) {
+      var el = {
+        tagName: tag, className: '', textContent: '', type: '', title: '',
+        children: [], onClick: null, style: {}, dataset: {},
+        appendChild: function (c) { this.children.push(c); return c; },
+        addEventListener: function (t, fn) { if (t === 'click') this.onClick = fn; },
+        setAttribute: function () {}, getAttribute: function () { return null; },
+        classList: { add: function () {}, remove: function () {},
+                     toggle: function () {}, contains: function () { return false; } }
+      };
+      if (tag === 'li') SIM_ROWS.push(el);
+      return el;
+    };
+    roomsShow(true);
+    netRenderRooms([{ code: 'AB12', host: 'Alan', players: 3, max: 9, inProgress: false }]);
+  `);
+  assert.strictEqual(client.has('rooms', 'off'), false);
+  assert.strictEqual(client.get('SIM_ROWS.length'), 1, 'one room, one row');
+
+  /* code, host, seats, then the button. */
+  client.run('SIM_ROWS[0].children[3].onClick();');
+  assert.strictEqual(client.has('rooms', 'off'), true,
+    'a dialog left up would cover the lobby it just sent you to');
+  assert.strictEqual(client.get('NET.simConnect'), 'join:AB12');
+});
+
+test('a round on a map the page cannot build ends the session', () => {
+  const match = SIM.createMatch({ latencyMs: 0, seed: 3 });
+  const members = [
+    { id: 'host-0001', name: 'HOST', role: 'host', slot: 0 },
+    { id: 'guest-001', name: 'GUEST', role: 'guest', slot: 1 }
+  ];
+  const start = (map) => JSON.stringify({
+    t: 'start',
+    v: SIM.NETP.VERSION,
+    authorityEpoch: match.guest.get('NET.authorityEpoch'),
+    round: match.guest.get('NET.round') + 1,
+    map,
+    members
+  });
+
+  match.guest.context.__wire = start('nuketown');
+  match.guest.run('netHandleWire(__wire)');
+  assert.strictEqual(match.guest.get('NET.round'), 2,
+    'a round on the map underfoot begins normally');
+  assert.strictEqual(match.guest.get('NET.mode'), 'guest');
+
+  /* The harness loads one map, so this stands in for a page a round has
+     rotated out from under: the relay only rotates to a map every member
+     announced, which makes this the shape of a page that lied or a relay
+     that changed its mind. Either way the honest move is to leave, not to
+     play the geometry it happens to have. */
+  match.guest.context.__wire = start('terminal');
+  match.guest.run('netHandleWire(__wire)');
+  assert.strictEqual(match.guest.get('NET.mode'), 'solo',
+    'a map this page cannot build ends the session rather than the wrong world');
+});

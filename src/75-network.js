@@ -1,0 +1,3177 @@
+/* =====================================================================
+   ACTION ZONE — host-authoritative browser multiplayer
+
+   The WebSocket server is deliberately only a room relay. The host browser
+   runs the existing simulation and publishes snapshots; guests predict their
+   own movement, send input, and interpolate everybody else.
+   ===================================================================== */
+
+const NETP = globalThis.NUKETOWN_PROTOCOL;
+
+/* Where the relay lives.
+
+   The page is served from a CDN but the WebSocket relay runs on its own
+   host, so the client cannot assume the two share an origin. Netlify (and
+   any static host) cannot proxy a WebSocket upgrade, which is why this is
+   a separate machine rather than a path on the same one.
+
+   Leave it empty to talk to whatever origin served the page — that is the
+   right answer when the relay is also serving the game. A ?server= in the
+   URL overrides it either way. */
+const NET_SERVER = 'relay.luckeysystems.com';
+const NET_SNAPSHOT_INTERVAL = 1 / 20;
+/* Events leave on their own clock so hit feedback does not wait for the next
+   snapshot. Faster than snapshots because they are small and latency-critical,
+   but not once per 60Hz tick: the relay closes a peer over 90 messages a
+   second, and snapshots already claim 20 of those. */
+const NET_EVENT_INTERVAL = 1 / 30;
+const NET_CHECKPOINT_INTERVAL = 1;
+/* One recorded step per simulated tick; a second of them is far more than the
+   round trip a replay ever has to cover, and bounds the buffer if the socket
+   stalls. */
+const NET_MAX_PENDING_STEPS = 120;
+/* Bounded so a guest that stalls and then floods cannot make the host work
+   through a backlog of stale intent. Overflow drops the oldest: being current
+   matters more than being complete. */
+const NET_MAX_INPUT_QUEUE = 6;
+/* Past this the replay landed somewhere unrelated to the screen -- a respawn,
+   not a misprediction -- and easing into it would drag the body across the
+   map. */
+const NET_SNAP_DISTANCE = 3;
+/* How much of a small residual to leave on screen for the next frame to
+   absorb. Low, because the residual is now nearly always zero. */
+const NET_RESIDUAL_SMOOTHING = 0.5;
+const NET_MAX_HISTORY_SAMPLES = 32;
+const NET_MAX_REPLICA_SAMPLES = 16;
+/* A guest picks the moment it wants the host to rewind the world to, and the
+   protocol's bound only stops it being absurd -- anywhere in the last 300ms is
+   accepted. That window is not a tolerance, it is a search space: a guest that
+   lies about it gets to pick, shot by shot, whichever instant in the last third
+   of a second had its target least behind cover.
+
+   The honest value is not a free parameter though. It is one-way latency plus
+   the guest's own interpolation delay, and it drifts with the connection rather
+   than jumping per shot. So the offset is smoothed per guest and the request is
+   held near it: the tolerance covers real jitter and nothing else. */
+const NET_LAG_OFFSET_SMOOTHING = 0.05;
+const NET_LAG_OFFSET_TOLERANCE = 0.03;
+/* Headroom on the ceiling for the parts of the offset the host cannot see --
+   the guest's jitter margin above the interpolation floor, and the age of the
+   relay's last round-trip sample. */
+const NET_LAG_OFFSET_SLACK = 0.05;
+/* Errors that mean "not that room" rather than "not this game". A quick-play
+   candidate can fill, close, or start changing host in the moment between the
+   poll that offered it and the socket that dials it; that is the next
+   candidate's turn, not a failure to report. */
+const NET_QUICK_RETRY_ERRORS = [
+  'room-not-found', 'room-full', 'room-migrating', 'unsupported-map'
+];
+
+/* A map id is protocol data; the catalog that gives it meaning is the page's.
+   These adapt the shared registry to the wire: what this page can play, a
+   received id checked against that, and what is on screen right now. Read
+   through MAPS rather than the module global, so the legacy-embedder registry
+   10-core falls back to — a stub holding one map — answers here too. */
+function netKnownMapIds() {
+  try {
+    return NETP.cleanMapIds(MAPS.ids());
+  } catch (error) {
+    return [];
+  }
+}
+
+function netKnownMapId(value) {
+  return NETP.cleanMapId(value, id => {
+    try { return !!MAPS.get(id); } catch (error) { return false; }
+  });
+}
+
+function netActiveMapId() {
+  let id = MAPS.DEFAULT_ID;
+  if (typeof activeMapId === 'function') {
+    try { id = activeMapId(); } catch (error) { return null; }
+  }
+  return netKnownMapId(id);
+}
+
+function netAdoptMap(id) {
+  const clean = netKnownMapId(id);
+  if (!clean) return false;
+  /* Without the map runtime the world cannot be rebuilt, so the only room
+     this page can honestly enter is one already on the map it booted with. */
+  if (typeof setActiveMap !== 'function') return clean === netActiveMapId();
+  try {
+    return setActiveMap(clean) === true && netActiveMapId() === clean;
+  } catch (error) {
+    return false;
+  }
+}
+
+const NET = {
+  mode: 'solo',                 // solo | connecting | host | guest
+  phase: 'idle',                // idle | connecting | lobby | playing
+  socket: null,
+  room: '',
+  id: '',
+  members: [],
+  authorityEpoch: 0,
+  round: 0,
+  nextMap: null,                // what the relay says the next round is on
+  wanted: null,
+  manualClose: false,
+  starting: false,
+  inputSeq: 0,
+  lastFireSeqSent: 0,
+  inputSentTimes: new Map(),
+  weaponSeq: 0,
+  lastInputAck: 0,
+  snapshotAcc: 0,
+  checkpointAcc: 0,
+  checkpointDirty: false,
+  eventAcc: 0,
+  pendingSteps: [],
+  lastResidual: 0,
+  lastSnapshotTick: -1,
+  lastSnapshotTime: -1,
+  snapshotInterval: NET_SNAPSHOT_INTERVAL,
+  hostClock: 0,
+  hostClockAt: 0,
+  oneWay: 0,
+  renderTime: 0,
+  lastInputSentAt: 0,
+  eventSeq: 0,
+  eventQueue: [],
+  lastEventSeq: 0,
+  predictedHits: [],
+  arrivalJitter: 0,
+  lastSnapshotAt: 0,
+  actorManifest: null,
+  manifestVersion: 1,
+  lastRawSnapshot: null,
+  lastCheckpoint: null,
+  migration: null,
+  lastKillerId: null,
+  scoreSignature: '',
+  connectTimer: 0,
+  startTimer: 0,
+  endReason: '',
+  roomsBusy: false,
+  roomsTimer: 0,
+  quick: null,                  // in-flight quick-play plan, or null
+  autoStartAt: 0,               // performance.now() the relay's clock reaches 0
+  countdownTimer: 0,
+  reports: new Set(),           // peer ids the relay has acknowledged a report for
+  reportSending: ''             // peer id of the report in flight, or ''
+};
+
+function netNow() { return performance.now(); }
+function netIsHost() { return NET.mode === 'host'; }
+function netIsGuest() { return NET.mode === 'guest'; }
+function netIsMultiplayer() { return netIsHost() || netIsGuest(); }
+function netHasTransport() { return NET.mode !== 'solo'; }
+function netSocketOpen() { return NET.socket && NET.socket.readyState === WebSocket.OPEN; }
+
+function netCleanCosmetics(value) {
+  return NETP && typeof NETP.sanitizeCosmetics === 'function'
+    ? NETP.sanitizeCosmetics(value)
+    : { character: null, weapons: { smg: null, shotgun: null, rifle: null } };
+}
+
+function netHasCosmetics(value) {
+  return !!(NETP && typeof NETP.hasCosmetics === 'function' && NETP.hasCosmetics(value));
+}
+
+/* EQUIPPED arrives with the store branch and is intentionally absent in this
+   one. Reading it only at the moment it is needed keeps a signed-out build and
+   a build whose account request is still in flight on the exact default path. */
+function netEquippedCosmetics() {
+  return netCleanCosmetics(typeof EQUIPPED !== 'undefined' ? EQUIPPED : null);
+}
+
+function netMemberCosmetics(member) {
+  return netCleanCosmetics(member && member.cosmetics);
+}
+
+function netActorCosmetics(actor) {
+  if (actor && actor.cosmetics) return netCleanCosmetics(actor.cosmetics);
+  const member = actor && NET.members.find(item => item.id === actor.netId);
+  if (member) return netMemberCosmetics(member);
+  return actor && actor === G.player
+    ? netEquippedCosmetics()
+    : netCleanCosmetics(null);
+}
+
+/* Every client dresses every player the same way without asking, because the
+   answer is the seat the relay already gave them rather than anything local.
+   That matters most for the one actor a guest builds itself: its own. */
+function netMemberWithColor(member) {
+  const info = {
+    id: member.id,
+    name: member.name,
+    role: member.role,
+    colors: jerseyForSlot(member.slot)
+  };
+  const cosmetics = netMemberCosmetics(member);
+  if (netHasCosmetics(cosmetics)) info.cosmetics = cosmetics;
+  return info;
+}
+
+function netLocalPlayerInfo() {
+  if (!netIsMultiplayer()) {
+    let saved = ''; try { saved = localStorage.getItem('pastel-nuketown-name') || ''; } catch (e) {}
+    const local = { id: null, name: saved || 'بازیکن', colors: PLAYER_COLOR };
+    const cosmetics = netEquippedCosmetics();
+    if (netHasCosmetics(cosmetics)) local.cosmetics = cosmetics;
+    return local;
+  }
+  const m = NET.members.find(member => member.id === NET.id);
+  if (!m) return { id: NET.id, name: 'بازیکن', colors: PLAYER_COLOR };
+  const local = { id: NET.id, name: m.name, colors: jerseyForSlot(m.slot) };
+  const cosmetics = netMemberCosmetics(m);
+  if (netHasCosmetics(cosmetics)) local.cosmetics = cosmetics;
+  return local;
+}
+
+function netAuthorityRoster() {
+  if (!netIsHost()) return [];
+  const out = [];
+  for (const m of NET.members) {
+    if (m.id !== NET.id) out.push(netMemberWithColor(m));
+  }
+  return out;
+}
+
+/* The builders that understand skins land on another branch. These wrappers
+   pass their optional arguments without changing the ordinary path: today the
+   extra argument is ignored, and once that branch lands it becomes the visual
+   layer over the same actor colours and weapon state. Keeping the seam here
+   also lets every existing caller in the game use the local selection without
+   editing the files owned by that branch. */
+const netAttachDefaultCharacter = attachCharacter;
+attachCharacter = function (actor) {
+  const skinId = netActorCosmetics(actor).character;
+  if (!skinId) return netAttachDefaultCharacter(actor);
+  actor.char = buildCharacter(actor.colors, skinId);
+  scene.add(actor.char.root);
+  actor.blob = makeBlobShadow();
+  actor.bubble = makeBubble();
+  actor.plate = makePlate();
+  actor.plate.sprite.position.set(0, CH.headC + 0.55, 0);
+  actor.char.root.add(actor.plate.sprite);
+  drawPlate(actor.plate, actor.name, actor.health, actor.maxHealth, actor.colors.body);
+};
+
+const netSetDefaultWeapon = vmSetWeapon;
+vmSetWeapon = function (weapon, force, skinId) {
+  if (skinId === undefined) {
+    const viewed = typeof KILLCAM !== 'undefined' && KILLCAM.shown
+      ? KILLCAM.shown
+      : G.player;
+    skinId = netActorCosmetics(viewed).weapons[weapon];
+  }
+  return netSetDefaultWeapon(weapon, force, skinId);
+};
+
+function netSetActorCosmetics(actor, value) {
+  if (!actor) return;
+  const before = netActorCosmetics(actor);
+  const after = netCleanCosmetics(value);
+  actor.cosmetics = after;
+  if (actor.char && before.character !== after.character) {
+    /* Character meshes contain the costume pieces, so a changed id is a
+       rebuild rather than a material tweak. This happens on a manifest or
+       authority transition, never on the 20Hz steady-state path. */
+    disposeActorVisuals(actor);
+    attachCharacter(actor);
+  }
+  if (actor === G.player && actor.weapon &&
+      before.weapons[actor.weapon] !== after.weapons[actor.weapon]) {
+    vmSetWeapon(actor.weapon, true, after.weapons[actor.weapon]);
+  }
+  /* A changed effect needs nothing here. It owns no mesh: it is read off
+     the actor at the instant a shot is drawn, so the next trigger pull is
+     already wearing it. */
+}
+
+/* Bots are the shortfall and nothing else, which is why the room cap and the
+   combatant count are the same number: fill every seat and this returns zero.
+   A guest builds only itself and takes the rest of the map from snapshots. */
+function netBotCount(humanCount) {
+  if (netIsGuest()) return 0;
+  if (netIsHost()) return Math.max(0, CFG.combatants - humanCount);
+  return CFG.bots;
+}
+
+/* Accepts a bare host, a ws(s):// URL, or an http(s):// URL, and hands back a
+   relay URL — or null if it is anything we should refuse to dial. */
+function netNormalizeServer(value) {
+  if (typeof value !== 'string') return null;
+  let configured = value.trim();
+  if (!configured) return null;
+
+  if (/^https?:\/\//i.test(configured))
+    configured = configured.replace(/^http/i, 'ws');
+  if (!/^wss?:\/\//i.test(configured))
+    configured = (location.protocol === 'https:' ? 'wss://' : 'ws://') + configured;
+
+  try {
+    const u = new URL(configured);
+    if ((u.protocol !== 'ws:' && u.protocol !== 'wss:') ||
+        u.username || u.password || u.hash) return null;
+    if (!u.pathname || u.pathname === '/') u.pathname = '/ws';
+    return u.toString();
+  } catch (e) {}
+  return null;
+}
+
+function netSameOriginURL() {
+  return (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws';
+}
+
+function netIsDevOrigin() {
+  return NETP.isPrivateHost(location.hostname);
+}
+
+function netWsURL() {
+  /* An explicit ?server= is the last word, including when it is malformed —
+     silently falling back to somewhere else would hide the mistake. */
+  const requested = QS.get('server');
+  if (requested) return netNormalizeServer(requested);
+
+  if (location.protocol === 'file:') return 'ws://localhost:8080/ws';
+  /* Private origins are serving the game from a relay on this LAN; stay on
+     that origin instead of sending players in the same room through public. */
+  if (netIsDevOrigin()) return netSameOriginURL();
+
+  return netNormalizeServer(NET_SERVER) || netSameOriginURL();
+}
+
+/* Do not send an account bearer token to a gameplay override. The store keeps
+   the origin that issued the token precisely so a shareable ?server= link
+   cannot redirect credentials; ws(s) and http(s) versions of one origin are
+   the same relay for this comparison. */
+function netAuthTokenForSocket(socketURL) {
+  if (typeof ACCOUNT === 'undefined' || !ACCOUNT ||
+      typeof ACCOUNT.token !== 'string' ||
+      typeof ACCOUNT.tokenOrigin !== 'string') return null;
+  if (!/^[A-Za-z0-9_-]{20,512}$/.test(ACCOUNT.token)) return null;
+  try {
+    const target = new URL(socketURL);
+    target.protocol = target.protocol === 'wss:' ? 'https:' : 'http:';
+    if (target.origin !== ACCOUNT.tokenOrigin) return null;
+    return ACCOUNT.token;
+  } catch (e) {}
+  return null;
+}
+
+/* Same server, plain HTTP. The room list is a poll rather than a socket
+   message on purpose: browsing happens before you have joined anything, and
+   the relay drops sockets that sit around without entering a room. */
+function netRoomsURL() {
+  const socketURL = netWsURL();
+  if (!socketURL) return null;
+  try {
+    const u = new URL(socketURL);
+    u.protocol = u.protocol === 'wss:' ? 'https:' : 'http:';
+    u.pathname = '/rooms';
+    u.search = '';
+    return u.toString();
+  } catch (e) {
+    return null;
+  }
+}
+
+/* Whether the list is worth keeping warm, which is not the same question as
+   whether the dialog is up: the poll feeds the online and matches counts on
+   the title screen as well, and a list fetched while the dialog was shut is
+   what makes it current the moment it opens. So this stays what it always
+   was — the setup menu is the thing on screen. */
+function netRoomsPanelOpen() {
+  const title = document.getElementById('title');
+  const menu = document.getElementById('menu');
+  return !!title && !title.classList.contains('off') &&
+         !!menu && !menu.hidden && !menu.classList.contains('pause');
+}
+
+/* ---- the room browser dialog ----------------------------------------
+   The store's pattern a third time: the same three ways out, the same
+   focus ring, the same title-made-inert underneath. */
+
+function roomsIsOpen() {
+  const panel = document.getElementById('rooms');
+  return !!panel && !panel.classList.contains('off');
+}
+
+function roomsFocusables() {
+  const panel = document.getElementById('rooms');
+  if (!panel || typeof panel.querySelectorAll !== 'function') return [];
+  const found = [];
+  for (const el of panel.querySelectorAll('button,a[href],input,select,textarea,[tabindex]')) {
+    if (el.disabled || el.hidden) continue;
+    if (el.getAttribute && el.getAttribute('tabindex') === '-1') continue;
+    found.push(el);
+  }
+  return found;
+}
+
+/* Tab is the scoreboard key and 70-game.js takes it with preventDefault on
+   every keydown there is, so a dialog on this page has to walk its own ring —
+   which is also, conveniently, exactly the wrap a modal wants. */
+function roomsTrapFocus(e) {
+  if (e.code !== 'Tab' || !roomsIsOpen()) return;
+  const items = roomsFocusables();
+  if (!items.length) return;
+  e.preventDefault();
+  const at = items.indexOf(document.activeElement);
+  const next = at < 0
+    ? (e.shiftKey ? items.length - 1 : 0)
+    : (at + (e.shiftKey ? items.length - 1 : 1)) % items.length;
+  items[next].focus();
+}
+
+const ROOMS_FOCUS = { opener: null };
+
+function roomsShow(open) {
+  const panel = document.getElementById('rooms');
+  if (!panel) return;
+  const wasOpen = roomsIsOpen();
+  panel.classList.toggle('off', !open);
+  const title = document.getElementById('title');
+  if (title && 'inert' in title) title.inert = !!open;
+
+  if (!open) {
+    /* Back where they came from. A dialog that drops focus on the body leaves
+       a keyboard player at the top of the document, several Tabs from the
+       button they just pressed. */
+    if (wasOpen) {
+      const opener = ROOMS_FOCUS.opener;
+      ROOMS_FOCUS.opener = null;
+      if (opener && typeof opener.focus === 'function') { try { opener.focus(); } catch (e) {} }
+    }
+    return;
+  }
+
+  if (!wasOpen) {
+    ROOMS_FOCUS.opener = document.activeElement || null;
+    const card = panel.querySelector ? panel.querySelector('.rooms-card') : null;
+    const target = card || roomsFocusables()[0];
+    if (target && typeof target.focus === 'function') { try { target.focus(); } catch (e) {} }
+  }
+  if (typeof SFX === 'object' && SFX) SFX.ui();
+  /* The poller keeps this list within five seconds of current, but opening is
+     the one moment somebody is about to act on it. */
+  netRefreshRooms(true);
+}
+
+/* Blank unless there is genuinely someone to play with. An unreachable or
+   too-old server has nothing to report, and "0 players online" would hang a
+   sign saying the game is dead right above the button that revives it —
+   solo players are invisible here, so an empty relay is the normal case. */
+function netRenderOnline(count) {
+  const el = document.getElementById('onlineCount');
+  if (!el) return;
+  el.textContent = typeof count === 'number' && count >= 2
+    ? count + ' players online'
+    : '';
+}
+
+/* Matches, not players: the relay counts a seat being taken, and one person
+   playing all evening is a lot of those. Hidden below 10 only so a relay that
+   has genuinely never been played does not announce it — past that the number
+   is allowed to be small and honest. */
+function netRenderMatches(count) {
+  const el = document.getElementById('matchesCount');
+  if (!el) return;
+  el.textContent = typeof count === 'number' && count >= 10
+    ? count.toLocaleString() + ' matches played'
+    : '';
+}
+
+function netRenderRooms(rooms, message) {
+  const list = document.getElementById('roomList');
+  if (!list) return;
+  list.innerHTML = '';
+
+  if (!rooms || !rooms.length) {
+    const empty = document.createElement('li');
+    empty.className = 'rooms-empty';
+    empty.textContent = message || 'هیچ اتاقی فعال نیست — برای ساخت اتاق، بازی آنلاین را بزنید.';
+    list.appendChild(empty);
+    return;
+  }
+
+  for (const room of rooms) {
+    const li = document.createElement('li');
+    if (room.inProgress) li.className = 'busy';
+
+    const code = document.createElement('strong');
+    code.textContent = room.code;
+    li.appendChild(code);
+
+    const host = document.createElement('span');
+    host.textContent = room.host;
+    li.appendChild(host);
+
+    const seats = document.createElement('b');
+    seats.textContent = room.players + '/' + room.max;
+    li.appendChild(seats);
+
+    /* A running room is joinable too — the wording is the only difference,
+       and it is worth keeping: DROP IN promises a firefight already in
+       progress rather than a lobby to wait in. */
+    const join = document.createElement('button');
+    join.className = 'mini-btn';
+    join.type = 'button';
+    join.textContent = room.inProgress ? 'ورود سریع' : 'ورود';
+    join.addEventListener('click', () => {
+      const input = document.getElementById('roomCode');
+      if (input) input.value = room.code;
+      roomsShow(false);
+      netConnect('join', room.code);
+    });
+    li.appendChild(join);
+
+    list.appendChild(li);
+  }
+}
+
+/* One fetch, two callers: the menu poller repaints the browser with it and
+   quick play chooses from it. Quick play deliberately does not reuse the
+   poller's last answer — a five-second-old list is old enough to send someone
+   at a room that has already filled or started. */
+function netFetchRooms() {
+  const url = netRoomsURL();
+  if (!url || typeof fetch !== 'function')
+    return Promise.reject(new Error('no room server'));
+
+  const control = typeof AbortController === 'function' ? new AbortController() : null;
+  const bail = control ? setTimeout(() => control.abort(), 4000) : 0;
+  const done = () => { if (bail) clearTimeout(bail); };
+
+  return fetch(url, { cache: 'no-store', signal: control ? control.signal : undefined })
+    .then(response => (response.ok ? response.json() : Promise.reject(response.status)))
+    .then(body => {
+      done();
+      return {
+        rooms: NETP.cleanRoomSummaries(body && body.rooms, NETP.MAX_ROOM_LIST),
+        online: body && body.online,
+        matches: body && body.matches
+      };
+    }, error => {
+      done();
+      return Promise.reject(error);
+    });
+}
+
+function netRefreshRooms(manual) {
+  if (NET.roomsBusy) return;
+  if (!manual && !netRoomsPanelOpen()) return;
+
+  const url = netRoomsURL();
+  if (!url) {
+    netRenderRooms(null, 'نشانی سرور چندنفره نامعتبر است.');
+    return;
+  }
+
+  NET.roomsBusy = true;
+  netFetchRooms()
+    .then(result => {
+      /* A refresh that lands after the player has already left the menu must
+         not repaint a list they can no longer act on. */
+      if (netRoomsPanelOpen()) netRenderRooms(result.rooms);
+      netRenderOnline(result.online);
+      netRenderMatches(result.matches);
+    })
+    .catch(() => {
+      if (netRoomsPanelOpen())
+        netRenderRooms(null, 'No room server reachable.');
+      netRenderOnline(null);
+      netRenderMatches(null);
+    })
+    .then(() => { NET.roomsBusy = false; });
+}
+
+/* PLAY is the entire matchmaking interface for anyone who does not care what a
+   room is: take the busiest one with a seat free, and open one when there is
+   nothing to join. Fullest-first on purpose — a thin population belongs in one
+   match rather than scattered across four rooms of one. */
+function netQuickPlay() {
+  if (NET.phase === 'connecting' || netIsMultiplayer()) return;
+
+  netSetMenuBusy(true);
+  netStatus('در حال پیدا کردن بازی…');
+  netRenderRooms(null, 'Looking for a match…');
+
+  netFetchRooms()
+    .then(result => {
+      if (NET.phase === 'connecting') return;
+      if (netRoomsPanelOpen()) netRenderRooms(result.rooms);
+      netRenderOnline(result.online);
+      netRenderMatches(result.matches);
+      netQuickNext({ candidates: netQuickCandidates(result.rooms) });
+    })
+    .catch(() => {
+      /* Failing to browse is not the same as failing to play: creating a room
+         still works on a relay that just missed an HTTP poll, and if it really
+         is down, the socket says so in one clear sentence instead of two. */
+      if (NET.phase !== 'connecting') netQuickNext({ candidates: [] });
+    });
+}
+
+/* Every room with a seat, running or not — a match already underway is the
+   better answer to PLAY, not the worse one, because it is the one that starts
+   shooting immediately. Fullest first regardless, so a thin population lands
+   in one match rather than scattered across four rooms of one. */
+function netQuickCandidates(rooms) {
+  return (rooms || [])
+    .filter(room => room.players < room.max)
+    .sort((a, b) => b.players - a.players)
+    .map(room => room.code);
+}
+
+function netQuickNext(plan) {
+  const code = plan.candidates.shift();
+  if (code) {
+    netStatus('در حال ورود به ' + code + '…');
+    netConnect('join', code, plan);
+    return;
+  }
+  plan.creating = true;
+  netStatus('در حال باز کردن اتاق…');
+  netConnect('create', '', plan);
+}
+
+function netSetMenuBusy(busy) {
+  for (const id of ['quickPlay', 'hostGame', 'joinGame', 'play']) {
+    const el = document.getElementById(id);
+    if (!el) continue;
+    /* #play is RESUME once there is a match behind the card, and resuming is
+       a local act — a call in flight to the relay has no business taking it
+       away, least of all a call that is in flight because it is not
+       answering. */
+    el.disabled = !!busy && !(id === 'play' && G.started);
+  }
+}
+
+function netRefreshRooms(manual) {
+  if (NET.roomsBusy || typeof fetch !== 'function') return;
+  if (!manual && !netRoomsPanelOpen()) return;
+
+  const url = netRoomsURL();
+  if (!url) {
+    netRenderRooms(null, 'نشانی سرور چندنفره نامعتبر است.');
+    return;
+  }
+
+  NET.roomsBusy = true;
+  const control = typeof AbortController === 'function' ? new AbortController() : null;
+  const bail = control ? setTimeout(() => control.abort(), 4000) : 0;
+
+  fetch(url, { cache: 'no-store', signal: control ? control.signal : undefined })
+    .then(response => (response.ok ? response.json() : Promise.reject(response.status)))
+    .then(body => {
+      const rooms = NETP.cleanRoomSummaries(body && body.rooms, NETP.MAX_ROOM_LIST);
+      /* A refresh that lands after the player has already left the menu must
+         not repaint a list they can no longer act on. */
+      if (netRoomsPanelOpen()) netRenderRooms(rooms);
+      netRenderOnline(body && body.online);
+      netRenderMatches(body && body.matches);
+    })
+    .catch(() => {
+      if (netRoomsPanelOpen())
+        netRenderRooms(null, 'No room server reachable.');
+      netRenderOnline(null);
+      netRenderMatches(null);
+    })
+    .then(() => {
+      if (bail) clearTimeout(bail);
+      NET.roomsBusy = false;
+    });
+}
+
+function netSend(msg, lossy) {
+  if (!netSocketOpen()) return false;
+  if (NET.socket.bufferedAmount > 1024 * 1024) {
+    netStatus('ارتباط بیش از حد عقب افتاده است؛ اتصال قطع می‌شود.', 'error');
+    try { NET.socket.close(1013, 'client backpressure'); } catch (e) {}
+    return false;
+  }
+  if (lossy && NET.socket.bufferedAmount > 128 * 1024) return false;
+  try {
+    const encoded = JSON.stringify(msg);
+    if (!encoded || (NETP && encoded.length > NETP.MAX_MESSAGE_BYTES)) return false;
+    NET.socket.send(encoded);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+function netCleanMembers(value) {
+  if (!Array.isArray(value) || value.length < 1 || value.length > NETP.MAX_PLAYERS) return null;
+  const ids = new Set();
+  const slots = new Set();
+  const members = [];
+  let hosts = 0;
+  for (const raw of value) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw) ||
+        typeof raw.id !== 'string' || !raw.id || raw.id.length > 80 ||
+        typeof raw.name !== 'string' || (raw.role !== 'host' && raw.role !== 'guest') ||
+        ids.has(raw.id) || !NETP.validSlot(raw.slot) || slots.has(raw.slot)) return null;
+    const name = NETP.cleanPlayerName(raw.name);
+    if (!name) return null;
+    ids.add(raw.id);
+    slots.add(raw.slot);
+    if (raw.role === 'host') hosts++;
+    const member = { id: raw.id, name: name, role: raw.role, slot: raw.slot };
+    const cosmetics = netCleanCosmetics(raw.cosmetics);
+    if (netHasCosmetics(cosmetics)) member.cosmetics = cosmetics;
+    members.push(member);
+  }
+  return hosts === 1 ? members : null;
+}
+
+function netStatus(text, kind) {
+  const el = document.getElementById('netStatus');
+  if (!el) return;
+  el.textContent = text || '';
+  el.dataset.kind = kind || '';
+}
+
+function netShowLobby() {
+  const menu = document.getElementById('menu');
+  const lobby = document.getElementById('lobby');
+  if (menu) menu.hidden = true;
+  if (lobby) lobby.hidden = false;
+  const code = document.getElementById('lobbyCode');
+  if (code) code.textContent = NET.room || '······';
+  const start = document.getElementById('netStart');
+  const play = document.getElementById('play');
+  if (play) play.disabled = false;
+  if (start) {
+    start.hidden = !netIsHost();
+    start.disabled = NET.phase !== 'lobby';
+  }
+  netRenderMembers();
+  netRenderCountdown();
+}
+
+function netShowMainMenu(message) {
+  const menu = document.getElementById('menu');
+  const lobby = document.getElementById('lobby');
+  if (menu) { menu.hidden = false; menu.classList.remove('pause'); }
+  if (lobby) lobby.hidden = true;
+  const play = document.getElementById('play');
+  if (play) play.textContent = 'تک‌نفره';
+  netSetMenuBusy(false);
+  const note = document.getElementById('menuNote');
+  if (note) note.textContent = message ||
+    'PLAY finds you a room with people in it. SOLO is you and eight bots.';
+  netRefreshRooms(true);
+}
+
+/* ---- automatic start ----------------------------------------------------
+   The lobby used to wait on a person: guests sat until the host clicked, and a
+   host who wandered off froze everyone behind them. A countdown fixed that
+   only on paper, because it ran in the host's own page — the page belonging to
+   the one player who, in the case worth fixing, had stopped looking at it. The
+   relay owns the clock now and starts the round itself. What is left here is a
+   display: the deadline arrives with the roster, and this counts it down so
+   everyone in the room, host and guest alike, can see the same number.
+
+   Nothing in this file starts a match on a timer any more. START MATCH is the
+   impatient host's shortcut and HOLD is the patient one's, and both of them go
+   to the relay. */
+
+/* Where the clock is shown: the lobby panel before the first round, and the
+   rematch button between rounds, which is the same wait wearing a scoreboard. */
+function netCountdownVisible() {
+  return netIsMultiplayer() &&
+    (NET.phase === 'lobby' || (NET.phase === 'playing' && G.over));
+}
+
+function netCancelAutoStart() {
+  if (NET.countdownTimer) clearInterval(NET.countdownTimer);
+  NET.countdownTimer = 0;
+  NET.autoStartAt = 0;
+  netRenderCountdown();
+}
+
+/* `remaining` is the relay's milliseconds-to-go, or null for a room that is not
+   counting. Held as a local deadline rather than a tick count so a throttled
+   background tab shows an honest number the moment it wakes up rather than one
+   frozen wherever its timer stopped. */
+function netUpdateAutoStart(remaining) {
+  if (!netCountdownVisible() || !Number.isFinite(remaining) || remaining < 0) {
+    netCancelAutoStart();
+    return;
+  }
+  NET.autoStartAt = netNow() + Math.min(remaining, 600000);
+  if (!NET.countdownTimer) NET.countdownTimer = setInterval(netTickAutoStart, 250);
+  netRenderCountdown();
+}
+
+function netTickAutoStart() {
+  if (!netCountdownVisible()) {
+    netCancelAutoStart();
+    return;
+  }
+  netRenderCountdown();
+}
+
+/* Rounded up, so the last second is shown as "1" rather than a "0" that sits
+   there for however long the start message spends in flight. */
+function netAutoStartSeconds() {
+  return Math.max(0, Math.ceil((NET.autoStartAt - netNow()) / 1000));
+}
+
+function netRenderCountdown() {
+  const wrap = document.getElementById('lobbyCountdown');
+  const text = document.getElementById('countdownText');
+  const hold = document.getElementById('holdStart');
+  const counting = netCountdownVisible() && !!NET.countdownTimer;
+  const seconds = counting ? netAutoStartSeconds() : 0;
+
+  if (wrap && text) {
+    if (counting && NET.phase === 'lobby') {
+      text.textContent = 'شروع تا ' + seconds + '…';
+      /* Only the host may hold, and holding is deferral rather than veto: the
+         relay grants a fixed extension per press, so a host who presses it and
+         walks away costs the room half a minute rather than the evening. */
+      if (hold) hold.hidden = !netIsHost();
+      wrap.hidden = false;
+    } else {
+      wrap.hidden = true;
+    }
+  }
+
+  /* Between rounds the scoreboard is the whole screen, so the clock goes on
+     the one button already there. Left alone once a start is in flight —
+     showOverScreen and netHostStart own the label then, and a countdown
+     overwriting "STARTING…" would be reporting a wait that is already over. */
+  const again = document.getElementById('again');
+  if (again && counting && G.over && !NET.starting) {
+    again.textContent = netIsHost()
+      ? 'شروع بازی مجدد (' + seconds + ')'
+      : 'بازی مجدد تا ' + seconds;
+  }
+}
+
+/* The rematch button's resting label and enabled state, in one place, because
+   two things paint it: showOverScreen when the card goes up, and the start
+   timeout when a start the relay never answered has to be taken back. A guest
+   gets a disabled button because only a host may start a round — which is the
+   reason MAIN MENU sits beside it and is never disabled at all. */
+function netSyncRematchButton() {
+  const again = document.getElementById('again');
+  if (!again) return;
+  if (netIsGuest()) {
+    again.textContent = 'در انتظار میزبان';
+    again.disabled = true;
+  } else if (netIsHost()) {
+    again.textContent = 'شروع بازی مجدد';
+    again.disabled = false;
+  } else {
+    again.textContent = 'بازی مجدد';
+    again.disabled = false;
+  }
+}
+
+function netSetPauseMenu(paused) {
+  const menu = document.getElementById('menu');
+  const lobby = document.getElementById('lobby');
+  if (menu) {
+    menu.hidden = false;
+    menu.classList.toggle('pause', !!paused);
+  }
+  if (lobby) lobby.hidden = true;
+  const note = document.getElementById('menuNote');
+  if (note && paused)
+    note.textContent = netIsMultiplayer() ? 'اتاق در حالی که این منو باز است به کار خود ادامه می‌دهد.' : 'بازی متوقف شد.';
+}
+
+function netRenderMembers() {
+  const list = document.getElementById('roster');
+  if (!list) return;
+  list.innerHTML = '';
+  for (const member of NET.members) {
+    const li = document.createElement('li');
+    const sw = document.createElement('i');
+    sw.style.background =
+      '#' + jerseyForSlot(member.slot).body.toString(16).padStart(6, '0');
+    li.appendChild(sw);
+    const name = document.createElement('span');
+    name.textContent = member.name + (member.id === NET.id ? ' (شما)' : '');
+    li.appendChild(name);
+    const role = document.createElement('b');
+    role.textContent = member.role === 'host' ? 'میزبان' : 'آماده';
+    li.appendChild(role);
+    list.appendChild(li);
+  }
+  const count = document.getElementById('rosterCount');
+  if (count) count.textContent = NET.members.length + ' / ' + (NETP ? NETP.MAX_PLAYERS : 9);
+  netRenderLobbyMap();
+}
+
+/* The lobby's answer to the title screen's MAP card: a readout of where the
+   next round lands, so a room that is about to change map says so before it
+   does it. Falls back to the map underfoot, which is what the next round uses
+   when there is nothing else in the pool everybody can build. */
+function netRenderLobbyMap() {
+  const el = document.getElementById('lobbyMap');
+  if (!el) return;
+  const id = NET.nextMap || netActiveMapId();
+  let spec = null;
+  try { spec = id ? MAPS.get(id) : null; } catch (error) {}
+  const meta = (spec && spec.meta) || {};
+  el.textContent = meta.name || (id ? id.toUpperCase() : '—');
+}
+
+function netResetTransport() {
+  if (NET.connectTimer) clearTimeout(NET.connectTimer);
+  NET.connectTimer = 0;
+  if (NET.socket) {
+    NET.manualClose = true;
+    try { NET.socket.close(1000, 'leaving'); } catch (e) {}
+  }
+  NET.socket = null;
+  NET.mode = 'solo';
+  NET.phase = 'idle';
+  NET.room = '';
+  NET.id = '';
+  NET.members = [];
+  NET.authorityEpoch = 0;
+  NET.round = 0;
+  NET.nextMap = null;
+  NET.wanted = null;
+  NET.starting = false;
+  NET.inputSeq = 0;
+  NET.lastFireSeqSent = 0;
+  NET.inputSentTimes.clear();
+  NET.weaponSeq = 0;
+  NET.lastInputAck = 0;
+  NET.snapshotAcc = 0;
+  NET.checkpointAcc = 0;
+  NET.checkpointDirty = false;
+  NET.eventAcc = 0;
+  NET.pendingSteps = [];
+  NET.lastResidual = 0;
+  NET.lastSnapshotTick = -1;
+  NET.lastSnapshotTime = -1;
+  NET.snapshotInterval = NET_SNAPSHOT_INTERVAL;
+  NET.hostClock = 0;
+  NET.hostClockAt = 0;
+  NET.oneWay = 0;
+  NET.renderTime = 0;
+  NET.lastInputSentAt = 0;
+  NET.eventSeq = 0;
+  NET.eventQueue = [];
+  NET.lastEventSeq = 0;
+  NET.predictedHits = [];
+  NET.arrivalJitter = 0;
+  NET.lastSnapshotAt = 0;
+  NET.actorManifest = null;
+  NET.manifestVersion = 1;
+  NET.lastRawSnapshot = null;
+  NET.lastCheckpoint = null;
+  NET.migration = null;
+  NET.lastKillerId = null;
+  NET.scoreSignature = '';
+  NET.quick = null;
+  NET.endReason = '';
+  /* Peer ids are per-connection, so a report list carried across a reconnect
+     would suppress the button against whoever inherits the id shape next. */
+  NET.reports.clear();
+  NET.reportSending = '';
+  netCancelStartTimeout();
+  netCancelAutoStart();
+  NET.manualClose = false;
+}
+
+function netConnect(kind, requestedRoom, quickPlan) {
+  if (!NETP || typeof WebSocket !== 'function') {
+    netStatus('بازی چندنفره در این مرورگر پشتیبانی نمی‌شود.', 'error');
+    netSetMenuBusy(false);
+    return;
+  }
+  const nameEl = document.getElementById('playerName');
+  let savedName = ''; try { savedName = localStorage.getItem('pastel-nuketown-name') || ''; } catch (e) {}
+  const name = NETP.cleanPlayerName((nameEl && nameEl.value) || savedName);
+  if (nameEl) nameEl.value = name;
+  try { localStorage.setItem('pastel-nuketown-name', name); } catch (e) {}
+  const room = NETP.normalizeRoomCode(requestedRoom || '');
+  if (kind === 'join' && room.length !== 6) {
+    netStatus('کد شش‌حرفی اتاق را وارد کنید.', 'error');
+    netSetMenuBusy(false);
+    return;
+  }
+
+  const listedEl = document.getElementById('roomPublic');
+  const listed = !listedEl || !!listedEl.checked;
+  const map = netActiveMapId();
+  const maps = netKnownMapIds();
+  if (!map || maps.indexOf(map) === -1) {
+    netStatus('نقشه انتخاب‌شده توسط این صفحه پشتیبانی نمی‌شود.', 'error');
+    netSetMenuBusy(false);
+    return;
+  }
+
+  netResetTransport();
+  NET.mode = 'connecting';
+  NET.phase = 'connecting';
+  NET.wanted = { kind, name, room, listed, map, maps,
+    cosmetics: netEquippedCosmetics() };
+  /* Reinstalled after the reset: a quick-play run outlives the individual
+     connection attempts it is made of. */
+  NET.quick = quickPlan || null;
+  if (!NET.quick)
+    netStatus(kind === 'create' ? 'در حال ساخت اتاق…' : 'در حال یافتن اتاق ' + room + '…');
+  netSetMenuBusy(true);
+
+  const socketURL = netWsURL();
+  if (!socketURL) {
+    netResetTransport();
+    netShowMainMenu();
+    netStatus('نشانی سرور چندنفره نامعتبر است.', 'error');
+    return;
+  }
+
+  let ws;
+  try { ws = new WebSocket(socketURL); }
+  catch (e) {
+    netResetTransport();
+    netShowMainMenu();
+    netStatus('باز کردن سرور چندنفره ممکن نشد.', 'error');
+    return;
+  }
+  NET.socket = ws;
+  ws.addEventListener('open', () => {
+    if (NET.socket !== ws || !NET.wanted) return;
+    const w = NET.wanted;
+    const hello = {
+      t: w.kind, v: NETP.VERSION, room: w.room, name: w.name,
+      listed: w.listed, map: w.map, maps: w.maps, cosmetics: w.cosmetics
+    };
+    const authToken = netAuthTokenForSocket(socketURL);
+    if (authToken) hello.authToken = authToken;
+    netSend(hello);
+  });
+  ws.addEventListener('message', e => netHandleWire(e.data));
+  ws.addEventListener('error', () => {
+    if (NET.socket === ws && NET.phase === 'connecting') {
+      netStatus('دسترسی به سرور چندنفره ممکن نشد.', 'error');
+      try { ws.close(); } catch (e) {}
+    }
+  });
+  ws.addEventListener('close', () => {
+    if (NET.socket !== ws) return;
+    const wasPlaying = NET.phase === 'playing';
+    const manual = NET.manualClose;
+    NET.socket = null;
+    if (!manual) {
+      if (wasPlaying) {
+        /* The relay explains itself before it hangs up — being told you sat
+           out the match is a different thing from losing your connection, and
+           the difference is the only thing that tells you to press PLAY. */
+        netEndSession(NET.endReason ||
+          'Connection lost — return to the menu to reconnect.');
+      } else {
+        NET.mode = 'solo'; NET.phase = 'idle';
+        const reason = NET.endReason;
+        netShowMainMenu(reason || 'Connection closed. Is the game server running?');
+        netStatus(reason || 'ارتباط بسته شد.', 'error');
+      }
+    }
+    netSetMenuBusy(false);
+  });
+  NET.connectTimer = setTimeout(() => {
+    if (NET.phase !== 'connecting') return;
+    netStatus('سرور چندنفره پاسخ نداد.', 'error');
+    try { ws.close(); } catch (e) {}
+  }, 9000);
+}
+
+function netHandleWire(raw) {
+  let msg;
+  try { msg = JSON.parse(raw); } catch (e) { return; }
+  if (!msg || typeof msg !== 'object' || Array.isArray(msg)) return;
+
+  if (msg.t === 'room') {
+    const members = netCleanMembers(msg.members);
+    const room = NETP.normalizeRoomCode(msg.room);
+    const map = netKnownMapId(msg.map);
+    if (NET.phase === 'connecting' && !map) {
+      netResetTransport();
+      netShowMainMenu();
+      netStatus('این اتاق از نقشه‌ای استفاده می‌کند که این صفحه پشتیبانی نمی‌کند. صفحه را دوباره بارگذاری کنید.',
+        'error');
+      netSetMenuBusy(false);
+      return;
+    }
+    if (NET.phase !== 'connecting' || msg.v !== NETP.VERSION ||
+        typeof msg.id !== 'string' || !msg.id ||
+        msg.id.length > 80 || room.length !== 6 ||
+        !map ||
+        !NETP.isAuthorityEpoch(msg.authorityEpoch) ||
+        (msg.role !== 'host' && msg.role !== 'guest') || !members ||
+        !members.some(member => member.id === msg.id && member.role === msg.role)) {
+      if (NET.socket) try { NET.socket.close(1008, 'invalid room handshake'); } catch (e) {}
+      return;
+    }
+    /* Geometry must move before any mid-round snapshot can arrive and validate
+       its actor positions against MAP.bounds. An unsupported room is refused,
+       never interpreted as the default map. */
+    if (!netAdoptMap(map)) {
+      netResetTransport();
+      netShowMainMenu();
+      netStatus('این اتاق از نقشه‌ای استفاده می‌کند که این صفحه پشتیبانی نمی‌کند. صفحه را دوباره بارگذاری کنید.',
+        'error');
+      netSetMenuBusy(false);
+      return;
+    }
+    if (NET.connectTimer) clearTimeout(NET.connectTimer);
+    NET.connectTimer = 0;
+    NET.id = msg.id;
+    NET.room = room;
+    NET.mode = msg.role === 'host' ? 'host' : 'guest';
+    /* A guest has not learned the match mode yet. Keep the lobby neutral until
+       the authority's first snapshot arrives, regardless of the URL that led
+       this browser here; a host keeps the mode it chose before creating. */
+    if (netIsGuest()) setGameMode(CFG.mode);
+    NET.phase = 'lobby';
+    NET.members = members;
+    NET.authorityEpoch = msg.authorityEpoch;
+    /* Adopt the room's round at the handshake. Joining a room that has
+       already played a round leaves NET.round behind otherwise, and every
+       subsequent `start` looks like it skipped ahead and gets ignored. */
+    NET.round = Number.isSafeInteger(msg.round) && msg.round >= 0 ? msg.round : 0;
+    /* Whether this room was chosen or fallen back to changes what the host
+       needs to hear, and the plan is finished either way. */
+    const opened = !!NET.quick && !!NET.quick.creating;
+    NET.quick = null;
+    /* A room that is already running has no lobby worth showing — the round
+       this player joined is happening now. Walk in. The world arrives on the
+       first snapshot that contains us, which is the host's answer to the
+       roster change the relay is broadcasting right about now. */
+    if (msg.started === true && netIsGuest()) {
+      netBeginMatch();
+      return;
+    }
+    netUpdateAutoStart(msg.autoStartIn);
+    netShowLobby();
+    netStatus(netIsHost()
+      ? (opened
+          ? 'Nothing to join, so this room is yours — copy the invite, or start now with bots.'
+          : 'Room ready — share the code, then start.')
+      : 'وارد اتاق ' + NET.room + ' شدید.');
+    return;
+  }
+  if (msg.t === 'host-changed') {
+    if (!netIsMultiplayer()) return;
+    const previousEpoch = NET.authorityEpoch;
+    const checked = NETP.sanitizeHostChanged(
+      msg, NET.id, NET.authorityEpoch, NET.round,
+      id => !!netKnownMapId(id));
+    if (!checked.ok) {
+      if (typeof checked.error === 'string' && checked.error.indexOf('map') !== -1)
+        netEndSession('Host migration named a map this page does not support.');
+      return;
+    }
+    const change = checked.value;
+    if (change.map !== netActiveMapId()) {
+      netEndSession('The room changed to an incompatible map. Reconnect to continue.');
+      return;
+    }
+    NET.authorityEpoch = change.authorityEpoch;
+    NET.round = change.round;
+    NET.members = change.members;
+    NET.mode = change.host === NET.id ? 'host' : 'guest';
+    NET.starting = false;
+    if (change.seamless) {
+      if (!netBeginSeamlessMigration(change, previousEpoch))
+        netEndSession('Host migration state was unsafe. Reconnect to continue.');
+    } else {
+      NET.phase = 'lobby';
+      netReturnToLobbyAfterHostChange(change.host);
+    }
+    return;
+  }
+  if (msg.t === 'authority-state' && netIsHost() && NET.phase === 'migrating' &&
+      msg.authorityEpoch === NET.authorityEpoch && msg.round === NET.round) {
+    netAcceptAuthorityState(msg);
+    return;
+  }
+  if (msg.t === 'authority-ready' && NET.phase === 'migrating' &&
+      msg.authorityEpoch === NET.authorityEpoch && msg.round === NET.round &&
+      msg.host === NET.members.find(member => member.role === 'host')?.id) {
+    netFinishSeamlessMigration();
+    return;
+  }
+  if (msg.t === 'members') {
+    const members = netCleanMembers(msg.members);
+    if (!netIsMultiplayer() || !members || !members.some(member => member.id === NET.id)) return;
+    NET.members = members;
+    /* An unknown id here is not worth ending a session over: it is a forecast
+       for a round that has not started, and the start message is where a map
+       this page cannot build actually becomes a problem. Forget it instead,
+       and the lobby falls back to naming the map it is standing in. */
+    NET.nextMap = netKnownMapId(msg.nextMap);
+    netRenderMembers();
+    netUpdateAutoStart(msg.autoStartIn);
+    if (NET.phase === 'migrating' && netIsHost()) {
+      const liveGuests = new Set(
+        members.filter(member => member.id !== NET.id).map(member => member.id));
+      for (const id of NET.migration.expected)
+        if (!liveGuests.has(id)) NET.migration.expected.delete(id);
+      netPruneDepartedPlayers();
+      netMaybeAuthorityReady();
+    }
+    if (netIsHost() && NET.phase === 'playing') {
+      /* Prune first: someone leaving in the same breath as someone arriving
+         frees the seat the arrival is about to want. */
+      netPruneDepartedPlayers();
+      netAdmitArrivals();
+    }
+    return;
+  }
+  if (msg.t === 'start') {
+    const members = netCleanMembers(msg.members);
+    /* Rounds only ever move forward. Requiring exactly +1 breaks any client
+       whose baseline came from the handshake rather than from round 1. */
+    if (!netIsMultiplayer() || !Number.isSafeInteger(msg.round) ||
+        msg.authorityEpoch !== NET.authorityEpoch ||
+        msg.round <= NET.round || !members ||
+        !members.some(member => member.id === NET.id)) return;
+    /* The world is rebuilt before the round is accepted, never after. Every
+       snapshot in it is validated against the map this page is standing in,
+       so a page that starts the round on last round's geometry does not play
+       one bad frame — it rejects the entire round and freezes. The relay only
+       rotates to a map everyone announced, so failing here means this page
+       cannot build a map it said it could; ending the session says so, where
+       staying would leave a player watching a lobby that never starts. */
+    const map = netKnownMapId(msg.map);
+    if (!map || !netAdoptMap(map)) {
+      netEndSession('This round uses a map this page cannot build. Reload to continue.');
+      return;
+    }
+    NET.round = msg.round;
+    NET.members = members;
+    NET.nextMap = null;
+    NET.starting = false;
+    netBeginMatch();
+    return;
+  }
+  if (msg.t === 'lobby' && netIsGuest() && NET.phase === 'playing' &&
+      msg.authorityEpoch === NET.authorityEpoch && msg.round === NET.round) {
+    netShowRemoteMatchOver(typeof msg.winner === 'string' ? msg.winner : null);
+    return;
+  }
+  if (msg.t === 'input' && netIsHost() && NET.phase === 'playing' &&
+      msg.authorityEpoch === NET.authorityEpoch &&
+      msg.round === NET.round && typeof msg.from === 'string') {
+    const a = G.actors.find(x => x.controller === 'remote' && x.netId === msg.from);
+    if (!a) return;
+    const checked = NETP.sanitizeInput(msg, a.lastInputSeq, a.lastWeaponSeq);
+    if (!checked.ok) return;
+    /* Relay-authored, so it is read off the envelope rather than the sanitized
+       payload: sanitizeInput only passes through what the guest is allowed to
+       author, and this is precisely the field it is not. */
+    if (Number.isFinite(msg.rttMs) && msg.rttMs >= 0 && msg.rttMs <= 10000)
+      a.netRelayRttMs = msg.rttMs;
+    /* Queued rather than assigned. A guest now sends one input per simulated
+       tick, and jitter means two can land between two host ticks; overwriting
+       would silently drop one, and a dropped input is one the guest predicted
+       with and the authority never applied -- exactly the disagreement that
+       replay exists to remove. */
+    if (!a.netInputQueue) a.netInputQueue = [];
+    a.netInputQueue.push(checked.value);
+    if (a.netInputQueue.length > NET_MAX_INPUT_QUEUE)
+      a.netInputQueue.splice(0, a.netInputQueue.length - NET_MAX_INPUT_QUEUE);
+    a.netInput = checked.value;
+    a.lastInputSeq = checked.value.seq;
+    a.lastWeaponSeq = checked.value.weaponSeq;
+    a.netInputAt = G.time;
+    return;
+  }
+  if (msg.t === 'snapshot' && netIsGuest() && NET.phase === 'playing' &&
+      msg.authorityEpoch === NET.authorityEpoch && msg.round === NET.round) {
+    netApplySnapshot(msg);
+    return;
+  }
+  if (msg.t === 'checkpoint' && netIsGuest() && NET.phase === 'playing' &&
+      msg.authorityEpoch === NET.authorityEpoch && msg.round === NET.round &&
+      netValidCheckpoint(msg)) {
+    NET.lastCheckpoint = msg;
+    return;
+  }
+  if (msg.t === 'event' && netIsGuest() && NET.phase === 'playing' &&
+      msg.authorityEpoch === NET.authorityEpoch &&
+      msg.round === NET.round && Array.isArray(msg.events) && msg.events.length <= 256) {
+    for (const event of msg.events) netApplyEvent(event);
+    return;
+  }
+  if (msg.t === 'reported') {
+    if (typeof msg.target === 'string' && msg.target) NET.reports.add(msg.target);
+    NET.reportSending = '';
+    updateReportButton();
+    return;
+  }
+  if (msg.t === 'error') {
+    /* Handled before the shared branch below: a refused report must not take
+       down the lobby's status line or re-enable a start button mid-match. It
+       is a dead end by design — the relay only refuses one for a target that
+       is not in the room, which means the roster moved under the button, and
+       the next death offers it again. */
+    if (msg.code === 'invalid-report' || msg.code === 'no-such-player') {
+      NET.reportSending = '';
+      updateReportButton();
+      return;
+    }
+    const errorText = typeof msg.message === 'string' && msg.message
+      ? msg.message.slice(0, 200)
+      : 'Multiplayer error.';
+    NET.starting = false;
+    /* Held for the close that follows: an error the relay hangs up on is the
+       reason, and by the time the socket shuts the message is gone. */
+    if (msg.code === 'idle' || msg.code === 'kicked' || msg.code === 'banned')
+      NET.endReason = errorText;
+    if (NET.phase === 'connecting') {
+      const plan = NET.quick;
+      /* Only a join can be retried elsewhere. A create that fails failed for a
+         reason the next attempt would hit too. */
+      const retry = !!plan && !plan.creating &&
+        NET_QUICK_RETRY_ERRORS.indexOf(msg.code) !== -1;
+      netResetTransport();
+      if (retry) {
+        netQuickNext(plan);
+        return;
+      }
+      netShowMainMenu();
+      netStatus(errorText, 'error');
+    } else {
+      const start = document.getElementById('netStart');
+      const again = document.getElementById('again');
+      if (start) start.disabled = NET.phase !== 'lobby';
+      if (again && G.over && netIsHost()) {
+        again.disabled = false;
+        again.textContent = 'شروع بازی مجدد';
+      }
+      netStatus(errorText, 'error');
+    }
+  }
+}
+
+/* ---- reporting a player ----
+   Who can be reported: a human, in this room, who is not you. Bots carry a
+   `bot-N` netId and are never in the roster, so the roster lookup is the whole
+   test and there is no separate rule for them. An actor with no netId at all
+   is a solo match, where there is nobody to report to. */
+function netReportableId(actor) {
+  if (!netIsMultiplayer() || !actor || !actor.netId || actor.netId === NET.id) return null;
+  return NET.members.some(member => member.id === actor.netId) ? actor.netId : null;
+}
+
+function netHasReported(netId) { return !!netId && NET.reports.has(netId); }
+
+/* Optimistic only as far as the button: `reportSending` disables it so the
+   same death cannot file four reports while the first is still in the air, but
+   the label does not claim the report landed until the relay says so. */
+function netReportPlayer(netId) {
+  if (!netId || netHasReported(netId) || NET.reportSending) return false;
+  if (!netSend({ t: 'report', v: NETP.VERSION, target: netId })) return false;
+  NET.reportSending = netId;
+  return true;
+}
+
+/* The relay answers with a roster carrying the new deadline, so there is
+   nothing to update here — and nothing to update if the send fails either,
+   which is the point: the clock this defers is not one this page owns. */
+function netHoldStart() {
+  if (!netIsHost() || NET.phase !== 'lobby' || NET.starting) return;
+  if (!netSend({ t: 'hold', v: NETP.VERSION, authorityEpoch: NET.authorityEpoch })) {
+    netStatus('مکث شروع بازی ممکن نشد.', 'error');
+    return;
+  }
+  netStatus('شروع بازی متوقف شد — وقتی آماده بودید «شروع بازی» را بزنید.');
+}
+
+/* A start the relay accepts and never answers used to strand the host on a
+   disabled STARTING… button — and between rounds that button was the only
+   control on the screen, so the page had to be reloaded to get out of a room
+   that was working fine. Matched to the connect timeout: if the round has not
+   begun by now, it is not going to without being asked again. */
+const NET_START_TIMEOUT = 9000;
+
+function netCancelStartTimeout() {
+  if (NET.startTimer) clearTimeout(NET.startTimer);
+  NET.startTimer = 0;
+}
+
+function netArmStartTimeout() {
+  netCancelStartTimeout();
+  NET.startTimer = setTimeout(() => {
+    NET.startTimer = 0;
+    if (!NET.starting) return;
+    NET.starting = false;
+    const start = document.getElementById('netStart');
+    if (start) start.disabled = NET.phase !== 'lobby';
+    if (G.over) netSyncRematchButton();
+    netStatus('بازی شروع نشد. دوباره تلاش کنید یا از اتاق خارج شوید.', 'error');
+  }, NET_START_TIMEOUT);
+}
+
+function netHostStart() {
+  if (!netIsHost() || NET.starting ||
+      (NET.phase !== 'lobby' && NET.phase !== 'playing')) return;
+  NET.starting = true;
+  netArmStartTimeout();
+  const start = document.getElementById('netStart');
+  const again = document.getElementById('again');
+  if (start) start.disabled = true;
+  if (again && G.over) {
+    again.disabled = true;
+    again.textContent = 'در حال شروع…';
+  }
+  netStatus('در حال شروع بازی…');
+  if (!netSend({
+    t: 'start',
+    v: NETP.VERSION,
+    authorityEpoch: NET.authorityEpoch
+  })) {
+    NET.starting = false;
+    netCancelStartTimeout();
+    if (start) start.disabled = false;
+    if (again && G.over) {
+      again.disabled = false;
+      again.textContent = 'شروع بازی مجدد';
+    }
+    netStatus('شروع بازی ممکن نشد.', 'error');
+  }
+}
+
+function netBeginMatch() {
+  NET.phase = 'playing';
+  NET.starting = false;
+  netCancelStartTimeout();
+  netCancelAutoStart();
+  NET.inputSeq = 0;
+  NET.lastFireSeqSent = 0;
+  NET.inputSentTimes.clear();
+  NET.weaponSeq = 0;
+  NET.lastInputAck = 0;
+  NET.snapshotAcc = 0;
+  NET.checkpointAcc = 0;
+  NET.checkpointDirty = true;
+  NET.eventAcc = 0;
+  NET.pendingSteps = [];
+  NET.lastResidual = 0;
+  NET.lastSnapshotTick = -1;
+  NET.lastSnapshotTime = -1;
+  NET.snapshotInterval = NET_SNAPSHOT_INTERVAL;
+  NET.hostClock = 0;
+  NET.hostClockAt = 0;
+  NET.oneWay = 0;
+  NET.renderTime = 0;
+  NET.lastInputSentAt = 0;
+  NET.eventSeq = 0;
+  NET.eventQueue = [];
+  NET.lastEventSeq = 0;
+  NET.predictedHits = [];
+  NET.arrivalJitter = 0;
+  NET.lastSnapshotAt = 0;
+  NET.actorManifest = null;
+  NET.manifestVersion = 1;
+  NET.lastRawSnapshot = null;
+  NET.lastCheckpoint = null;
+  NET.migration = null;
+  NET.lastKillerId = null;
+  NET.scoreSignature = '';
+  IN.firing = false;
+  IN._heldSemi = false;
+  IN.touchSemiArmed = false;
+  IN._releaseFireAfterTick = false;
+  IN.fireSeq = 0;
+  IN.fireRenderTime = 0;
+  IN.reloadSeq = 0;
+  startMatch();
+  if (netIsHost()) {
+    /* Establish the actor manifest before the first combat event can race
+       ahead of it on a guest connection. */
+    NET.snapshotAcc = 0.05;
+    netAfterSimulation(0);
+  }
+  if (netIsMultiplayer()) {
+    /* A message from the host is not a browser user gesture, so Pointer Lock
+       cannot reliably start here. Leave a one-click deploy card. The host
+       keeps simulating with neutral input while its card is open.
+
+       That card is the #play button, which netConnect disabled while dialling.
+       Anyone arriving through the lobby had it switched back on there; a
+       drop-in never passes through the lobby, so re-enable it here — a deploy
+       card nobody can click is a player frozen at the door. */
+    setPaused(true);
+    netSetMenuBusy(false);
+    document.getElementById('play').textContent = 'ورود به بازی';
+    const note = document.getElementById('menuNote');
+    if (note) note.textContent = 'بازی شروع شده است. برای ورود کلیک کنید.';
+  }
+  netStatus('');
+  showHint(netIsHost() ? 'شما میزبان هستید' : 'متصل به ' + NET.room);
+}
+
+/* Leaving is one act whether the round is running, finished, or never started,
+   so LEAVE MATCH, MAIN MENU and the lobby's own LEAVE all land here. Dropping
+   the socket is what leaves the room — the relay frees the seat on the close,
+   which is why this must not be reached by tearing the match down alone. */
+function netLeaveMatch(reason) {
+  netResetTransport();
+  returnToMenu(reason);
+  if (!reason) netStatus('');
+}
+
+function netLeaveLobby() { netLeaveMatch(); }
+
+function netReturnToLobbyAfterHostChange(hostId) {
+  stopMatch();
+  netShowLobby();
+
+  const promoted = hostId === NET.id;
+  const host = NET.members.find(member => member.id === hostId);
+  netStatus(promoted
+    ? 'The previous host left. You are the new host — start a fresh round.'
+    : ((host ? host.name : 'یک بازیکن') + ' میزبان جدید است. در انتظار دور تازه بازی.'));
+}
+
+function netValidMigrationSnapshot(snapshot, previousEpoch, round) {
+  if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot) ||
+      snapshot.authorityEpoch !== previousEpoch || snapshot.round !== round ||
+      !netValidSnapshot(snapshot)) return false;
+  const ids = new Set(snapshot.actors.map(actor => actor.netId));
+  if (!ids.has(NET.id)) return false;
+  return true;
+}
+
+function netCheckpointMetadata(checkpoint) {
+  return new Map(checkpoint.actors.map(actor => [actor.netId, actor]));
+}
+
+function netCheckpointEvents(checkpoint) {
+  return checkpoint.events.concat(checkpoint.confirmEvents)
+    .sort((a, b) => a.id - b.id);
+}
+
+function netBotOrdinal(netId) {
+  const match = /^bot-([1-9]\d*)$/.exec(netId);
+  return match ? Number(match[1]) - 1 : null;
+}
+
+function netRestoreAmmoStore(actor, metadata) {
+  actor._ammoBy = {};
+  for (const weapon of Object.keys(metadata.ammoBy)) {
+    const value = metadata.ammoBy[weapon];
+    actor._ammoBy[weapon] = { ammo: value[0], reserve: value[1] };
+  }
+  actor._ammoBy[actor.weapon] = { ammo: actor.ammo, reserve: actor.reserve };
+}
+
+function netHydrateActor(actor, state, metadata, local) {
+  actor.id = state.id;
+  actor.netId = state.netId;
+  actor.name = NETP.cleanPlayerName(state.name);
+  actor.isPlayer = local;
+  actor.isHuman = !!state.human;
+  actor.controller = local ? 'local' : (state.human ? 'remote' : 'bot');
+  actor.skill = metadata.skill;
+  actor.colors = {
+    body: state.colors.body, trim: state.colors.trim, name: state.colors.name
+  };
+  netSetActorCosmetics(actor, state.cosmetics);
+  actor.pos.x = state.pos[0]; actor.pos.y = state.pos[1]; actor.pos.z = state.pos[2];
+  actor.vel.x = state.vel[0]; actor.vel.y = state.vel[1]; actor.vel.z = state.vel[2];
+  actor.yaw = state.yaw; actor.pitch = state.pitch;
+  actor.aimYaw = state.aimYaw; actor.aimPitch = state.aimPitch;
+  actor.bodyYaw = state.bodyYaw;
+  actor.onGround = !!state.onGround;
+  actor.aiming = !!state.aiming;
+  actor.health = state.health; actor.maxHealth = state.maxHealth;
+  actor.alive = !!state.alive;
+  actor.deathT = state.deathT; actor.respawnT = state.respawnT;
+  actor.shield = state.shield;
+  actor.weapon = state.weapon;
+  actor.ammo = state.ammo; actor.reserve = state.reserve;
+  actor.reloadT = state.reloadT;
+  actor.fireCd = 0;
+  actor.kills = state.kills; actor.deaths = state.deaths;
+  actor.confirms = state.confirms;
+  actor.streak = state.streak; actor.bestStreak = state.bestStreak;
+  actor.lastHitBy = state.lastHitBy;
+  actor.stepPhase = 0;
+  actor.pendingFireUntil = 0;
+  actor.pendingFireSeq = 0;
+  actor.pendingRenderTime = 0;
+  actor.netInput = null;
+  actor.netInputQueue = [];
+  actor.lastInputSeq = -1;
+  actor.lastWeaponSeq = -1;
+  actor.inputAck = 0;
+  actor.weaponAck = 0;
+  actor.lastFireSeq = 0;
+  actor.lastReloadSeq = 0;
+  actor.netLagOffset = null;
+  actor.netRelayRttMs = 0;
+  actor.netHistory = [];
+  actor.netSamples = [];
+  netRestoreAmmoStore(actor, metadata);
+
+  if (actor.controller === 'bot') {
+    const ordinal = netBotOrdinal(actor.netId);
+    actor.brain = G.aiOK && ordinal !== null
+      ? AI.createBrain({
+        id: actor.id,
+        seed: 1000 + ordinal * 77,
+        skill: actor.skill
+      })
+      : null;
+  } else {
+    actor.brain = null;
+  }
+}
+
+function netHydrateMigration(snapshot, checkpoint) {
+  const metadata = netCheckpointMetadata(checkpoint);
+  const members = new Set(NET.members.map(member => member.id));
+  const oldActors = G.actors.slice();
+  const restored = [];
+  const manifest = new Set();
+  let pruned = false;
+
+  for (const state of snapshot.actors) {
+    const slow = metadata.get(state.netId);
+    if (!slow) return false;
+    if ((state.human && (slow.controller === 'bot' || !slow.human)) ||
+        (!state.human && (slow.controller !== 'bot' || slow.human))) return false;
+    if (state.human && !members.has(state.netId)) {
+      pruned = true;
+      continue;
+    }
+    const local = state.netId === NET.id;
+    let actor = local ? G.player : oldActors.find(item => item.netId === state.netId);
+    if (!actor) {
+      const cosmetics = netCleanCosmetics(state.cosmetics);
+      actor = makeActor({
+        id: state.id,
+        netId: state.netId,
+        name: NETP.cleanPlayerName(state.name),
+        controller: state.human ? 'remote' : 'bot',
+        isHuman: !!state.human,
+        colors: {
+          body: state.colors.body, trim: state.colors.trim, name: state.colors.name
+        },
+        weapon: state.weapon,
+        skill: slow.skill
+      });
+      actor.cosmetics = cosmetics;
+      attachCharacter(actor);
+    }
+    netHydrateActor(actor, state, slow, local);
+    restored.push(actor);
+    manifest.add(state.netId);
+  }
+  if (!manifest.has(NET.id)) return false;
+  for (const actor of oldActors) {
+    if (!restored.includes(actor)) disposeActorVisuals(actor);
+  }
+  G.actors = restored;
+  G.player = restored.find(actor => actor.netId === NET.id);
+  _nextId = restored.reduce((max, actor) => Math.max(max, actor.id), 0) + 1;
+  G.time = snapshot.time;
+  G.tick = snapshot.tick;
+  G.over = snapshot.over;
+  G.winner = snapshot.winner
+    ? restored.find(actor => actor.netId === snapshot.winner) || null
+    : null;
+  if (snapshot.over && !G.winner) return false;
+  G.fixedAcc = 0;
+  setGameMode(snapshot.mode);
+  netReconcileDonuts(snapshot.donuts);
+
+  NET.actorManifest = manifest;
+  NET.manifestVersion = snapshot.manifestVersion + (pruned ? 1 : 0);
+  NET.lastRawSnapshot = snapshot;
+  NET.lastCheckpoint = checkpoint;
+  NET.lastSnapshotTick = snapshot.tick;
+  NET.lastSnapshotTime = snapshot.time;
+  NET.hostClock = snapshot.time;
+  NET.hostClockAt = performance.now() / 1000;
+  NET.pendingSteps = [];
+  NET.inputSentTimes.clear();
+  NET.lastInputAck = NET.inputSeq;
+  const checkpointEvents = netCheckpointEvents(checkpoint);
+  NET.eventSeq = Math.max(
+    snapshot.eventSeq,
+    ...checkpointEvents.map(event => event.id)
+  );
+  NET.eventQueue = netIsHost()
+    ? checkpointEvents.filter(event => netValidEvent(event, manifest))
+    : [];
+  NET.checkpointDirty = pruned;
+  NET.snapshotAcc = 0;
+  NET.checkpointAcc = 0;
+  NET.eventAcc = 0;
+  NET.lastResidual = 0;
+
+  if (G.player) vmSetWeapon(G.player.weapon);
+  refreshBoard();
+  updateHUD();
+  return true;
+}
+
+function netSendAuthorityState() {
+  if (!netIsGuest() || NET.phase !== 'migrating' || !G.player) return;
+  const state = NET.migration.authorityState;
+  netSend({
+    t: 'authority-state',
+    v: NETP.VERSION,
+    authorityEpoch: NET.authorityEpoch,
+    round: NET.round,
+    inputSeq: state.inputSeq,
+    fireSeq: state.fireSeq,
+    reloadSeq: state.reloadSeq,
+    weaponSeq: state.weaponSeq,
+    weapon: state.weapon
+  });
+}
+
+function netBeginSeamlessMigration(change, previousEpoch) {
+  const snapshot = change.snapshot;
+  const checkpoint = change.checkpoint;
+  const sourceEpoch = snapshot && snapshot.authorityEpoch;
+  if (!NETP.isAuthorityEpoch(sourceEpoch) ||
+      sourceEpoch >= change.authorityEpoch ||
+      sourceEpoch > previousEpoch ||
+      (NET.lastRawSnapshot && NET.lastRawSnapshot.round === change.round &&
+       snapshot.tick < NET.lastRawSnapshot.tick) ||
+      (NET.lastCheckpoint && NET.lastCheckpoint.round === change.round &&
+       checkpoint.tick < NET.lastCheckpoint.tick) ||
+      !netValidMigrationSnapshot(snapshot, sourceEpoch, change.round) ||
+      !netValidCheckpoint(checkpoint) ||
+      checkpoint.authorityEpoch !== sourceEpoch ||
+      checkpoint.round !== change.round ||
+      change.map !== snapshot.map ||
+      checkpoint.map !== snapshot.map ||
+      checkpoint.mode !== snapshot.mode ||
+      checkpoint.manifestVersion !== snapshot.manifestVersion) return false;
+  const metadata = netCheckpointMetadata(checkpoint);
+  if (metadata.size !== snapshot.actors.length ||
+      snapshot.actors.some(actor => !metadata.has(actor.netId))) return false;
+
+  NET.phase = 'migrating';
+  NET.migration = {
+    paused: G.paused,
+    frozen: G.frozen,
+    expected: new Set(
+      change.members.filter(member => member.id !== NET.id).map(member => member.id)),
+    received: new Set(),
+    readySent: false,
+    authorityState: {
+      inputSeq: NET.inputSeq,
+      fireSeq: IN.fireSeq,
+      reloadSeq: IN.reloadSeq,
+      weaponSeq: NET.weaponSeq,
+      weapon: G.player.weapon
+    }
+  };
+  G.frozen = true;
+  G.fixedAcc = 0;
+  if (!netHydrateMigration(snapshot, checkpoint)) return false;
+  if (netIsHost()) netMaybeAuthorityReady();
+  else netSendAuthorityState();
+  netStatus(netIsHost()
+    ? 'Taking over the current round…'
+    : 'The host changed — resuming the current round…');
+  return true;
+}
+
+function netAcceptAuthorityState(message) {
+  if (!NET.migration || typeof message.from !== 'string' ||
+      !NET.migration.expected.has(message.from)) return;
+  const checked = NETP.sanitizeAuthorityState(message);
+  if (!checked.ok) return;
+  const actor = G.actors.find(item =>
+    item.controller === 'remote' && item.netId === message.from);
+  if (!actor) return;
+  const state = checked.value;
+  actor.lastInputSeq = state.inputSeq;
+  actor.inputAck = state.inputSeq;
+  actor.lastFireSeq = state.fireSeq;
+  actor.lastReloadSeq = state.reloadSeq;
+  actor.lastWeaponSeq = state.weaponSeq;
+  actor.weaponAck = state.weaponSeq;
+  /* A new authority inherits none of the old one's read on this guest's
+     latency. Re-seed from what arrives here rather than carry over an estimate
+     measured against a clock that has just been replaced. */
+  actor.netLagOffset = null;
+  actor.netRelayRttMs = 0;
+  if (actor.weapon !== state.weapon) switchRemoteWeapon(actor, state.weapon);
+  actor.netInput = {
+    fwd: 0, strafe: 0, jump: false, sprint: false, fire: false,
+    fireSeq: state.fireSeq, reloadSeq: state.reloadSeq,
+    yaw: actor.yaw, pitch: actor.pitch, weapon: actor.weapon,
+    seq: state.inputSeq, weaponSeq: state.weaponSeq, renderTime: G.time
+  };
+  actor.netInputAt = G.time;
+  NET.migration.received.add(message.from);
+  netMaybeAuthorityReady();
+}
+
+function netMaybeAuthorityReady() {
+  if (!netIsHost() || NET.phase !== 'migrating' || !NET.migration ||
+      NET.migration.readySent) return;
+  for (const id of NET.migration.expected)
+    if (!NET.migration.received.has(id)) return;
+  NET.migration.readySent = netSend({
+    t: 'authority-ready',
+    v: NETP.VERSION,
+    authorityEpoch: NET.authorityEpoch,
+    round: NET.round,
+    tick: G.tick
+  });
+}
+
+function netFinishSeamlessMigration() {
+  if (!NET.migration) return;
+  const migration = NET.migration;
+  NET.migration = null;
+  NET.phase = 'playing';
+  G.frozen = migration.frozen;
+  G.paused = migration.paused;
+  G.fixedAcc = 0;
+  NET.lastSnapshotAt = performance.now() / 1000;
+  NET.hostClockAt = NET.lastSnapshotAt;
+  netStatus('');
+  showHint(netIsHost() ? 'شما میزبان هستید' : 'تغییر میزبان کامل شد');
+  if (netIsHost()) netAfterSimulation(0, true);
+}
+
+function netEndSession(message) {
+  netResetTransport();
+  returnToMenu(message);
+}
+
+/* ---- drop-in ------------------------------------------------------------
+   Seating a player in a round already underway is netPruneDepartedPlayers run
+   backwards, and it works for the same reason: the actor manifest is versioned
+   and guests already accept it changing without a round boundary. The arrival
+   needs no world handed to it — the next snapshot is the world, and until the
+   host has seated them their client ignores snapshots it is not in. */
+
+/* The bot wearing the arrival's jersey is the bot that leaves, because the
+   room has exactly as many seats as jerseys: whoever has the colour is
+   sitting in the chair. That it is a specific bot rather than the least
+   missed one is the price of never putting two players in the same colour,
+   and in a firefight the colour matters more.
+
+   Nobody may be wearing it — a match that already lost players has jerseys
+   going spare — and then the arrival costs nothing. */
+function netEvictBotForArrival(slot) {
+  const jersey = jerseyForSlot(slot).name;
+  for (const a of G.actors) {
+    if (a.controller === 'bot' && a.colors && a.colors.name === jersey) {
+      detachActor(a);
+      return;
+    }
+  }
+}
+
+function netSeatArrival(member) {
+  netEvictBotForArrival(member.slot);
+  const info = netMemberWithColor(member);
+  const actor = makeActor({
+    name: info.name,
+    netId: info.id,
+    isHuman: true,
+    controller: 'remote',
+    colors: info.colors,
+    weapon: 'smg'
+  });
+  attachCharacter(actor);
+  G.actors.push(actor);
+  /* Straight onto a spawn point with the usual shield rather than wherever
+     the actor happened to be constructed. Walking into a live firefight with
+     no cover is the one way drop-in could be worse than waiting. */
+  respawnActor(actor, true);
+  showHint(actor.name + ' DROPPED IN');
+}
+
+function netAdmitArrivals() {
+  /* Not while the round is decided: the over card is up, scores are final,
+     and the host is about to put the room back in the lobby anyway. */
+  if (!netIsHost() || NET.phase !== 'playing' || G.over) return;
+
+  const seated = new Set(G.actors.map(a => a.netId));
+  let added = 0;
+  for (const member of NET.members) {
+    if (member.id === NET.id || seated.has(member.id)) continue;
+    netSeatArrival(member);
+    added++;
+  }
+  if (!added) return;
+
+  /* An arrival always costs the bot in its jersey, even in a match that had
+     room to spare — so top the match back up here as well as on departure,
+     or a half-empty room would stay half-empty however many people joined. */
+  netBackfillBots();
+  NET.manifestVersion++;
+  NET.checkpointDirty = true;
+  refreshBoard();
+  /* Publish now rather than on the next 20Hz beat: until a snapshot carries
+     them, the arrival is staring at an empty map. */
+  netAfterSimulation(0, true);
+}
+
+/* The other half of drop-in, and the half a nine-seat room cannot do without.
+   A leaver used to just be subtracted: four seats meant a match could lose at
+   most three people and still have five bots in it, so nobody noticed. Nine
+   seats means a full room can empty out to two players and an empty map, so
+   the bots that stood aside for the humans come back when they go. */
+function netBackfillBots() {
+  if (!netIsHost() || NET.phase !== 'playing' || G.over) return;
+  const spare = freeJerseys(G.actors);
+  const missing = Math.min(CFG.combatants - G.actors.length, spare.length);
+  for (let i = 0; i < missing; i++) {
+    const bot = makeBot(spare[i]);
+    G.actors.push(bot);
+    respawnActor(bot, true);
+  }
+}
+
+function netPruneDepartedPlayers() {
+  const live = new Set(NET.members.map(m => m.id));
+  let changed = false;
+  for (const a of G.actors.slice()) {
+    if (a.controller === 'remote' && !live.has(a.netId)) {
+      detachActor(a);
+      changed = true;
+    }
+  }
+  /* Only once the departed are actually gone: the backfill reads the jerseys
+     nobody is wearing, and a leaver still on the list is still wearing one. */
+  if (changed) netBackfillBots();
+  if (changed && netIsHost()) {
+    NET.manifestVersion++;
+    NET.checkpointDirty = true;
+  }
+  refreshBoard();
+}
+
+function netActorId(a) {
+  return a && (a.netId || ('actor-' + a.id));
+}
+
+function netOnLocalWeaponChanged() {
+  if (netIsGuest()) NET.weaponSeq++;
+  if (netIsHost()) NET.checkpointDirty = true;
+}
+
+function netOnAuthoritySlowStateChanged() {
+  if (netIsHost()) NET.checkpointDirty = true;
+}
+
+function netRound(v) { return Math.round(v * 1000) / 1000; }
+function netPackDonutActor(id, netId) {
+  const actor = G.actors.find(item => item.id === id && netActorId(item) === netId);
+  return actor ? { id: id, netId: netId } : { id: null, netId: null };
+}
+
+function netPackDonut(donut) {
+  /* Donuts survive their owners. Preserve a reference only while both halves
+     still name the same live actor; this also prevents a recycled numeric id
+     from changing a stale donut's outcome after host migration. */
+  const owner = netPackDonutActor(donut.owner, donut.ownerNetId);
+  const killer = netPackDonutActor(donut.killer, donut.killerNetId);
+  return {
+    id: donut.id,
+    owner: owner.id,
+    killer: killer.id,
+    ownerNetId: owner.netId,
+    killerNetId: killer.netId,
+    x: netRound(donut.x),
+    y: netRound(donut.y),
+    z: netRound(donut.z),
+    t: netRound(donut.t)
+  };
+}
+
+function netPackDonuts() {
+  return G.donuts.slice(0, DONUT_MAX).map(netPackDonut);
+}
+
+function netPackActor(a) {
+  const remote = a.controller === 'remote';
+  const packed = {
+    id: a.id,
+    netId: netActorId(a),
+    name: a.name,
+    human: !!a.isHuman,
+    colors: { body: a.colors.body, trim: a.colors.trim, name: a.colors.name || '' },
+    pos: [netRound(a.pos.x), netRound(a.pos.y), netRound(a.pos.z)],
+    vel: [netRound(a.vel.x), netRound(a.vel.y), netRound(a.vel.z)],
+    yaw: netRound(a.yaw),
+    pitch: netRound(a.pitch),
+    aimYaw: netRound(a.aimYaw),
+    aimPitch: netRound(a.aimPitch),
+    bodyYaw: netRound(a.bodyYaw),
+    onGround: !!a.onGround,
+    aiming: !!a.aiming,
+    health: netRound(a.health),
+    maxHealth: a.maxHealth,
+    alive: !!a.alive,
+    deathT: netRound(a.deathT),
+    respawnT: netRound(a.respawnT),
+    shield: netRound(a.shield),
+    weapon: a.weapon,
+    ammo: a.ammo,
+    reserve: a.reserve,
+    reloadT: netRound(a.reloadT),
+    ack: remote ? a.inputAck : 0,
+    weaponSeq: remote ? a.weaponAck : 0,
+    kills: a.kills,
+    deaths: a.deaths,
+    confirms: a.confirms,
+    streak: a.streak,
+    bestStreak: a.bestStreak,
+    lastHitBy: a.lastHitBy
+  };
+  const cosmetics = a.isHuman ? netActorCosmetics(a) : netCleanCosmetics(null);
+  if (netHasCosmetics(cosmetics)) packed.cosmetics = cosmetics;
+  return packed;
+}
+
+function netPackCheckpointActor(a) {
+  const ammoBy = {};
+  const stored = a._ammoBy && typeof a._ammoBy === 'object' ? a._ammoBy : {};
+  for (const weapon of NETP.ALLOWED_WEAPONS) {
+    const value = stored[weapon];
+    if (value && netSafeCount(value.ammo) && netSafeCount(value.reserve))
+      ammoBy[weapon] = [value.ammo, value.reserve];
+  }
+  ammoBy[a.weapon] = [Math.max(0, Math.floor(a.ammo)), Math.max(0, Math.floor(a.reserve))];
+  return {
+    netId: netActorId(a),
+    controller: a.controller,
+    human: !!a.isHuman,
+    skill: a.skill || 'normal',
+    ammoBy: ammoBy
+  };
+}
+
+function netSendCheckpoint() {
+  if (!netIsHost() || NET.phase !== 'playing' || !netSocketOpen()) return false;
+  return netSend({
+    t: 'checkpoint',
+    v: NETP.VERSION,
+    authorityEpoch: NET.authorityEpoch,
+    round: NET.round,
+    tick: G.tick,
+    time: G.time,
+    mode: G.mode,
+    map: netActiveMapId(),
+    manifestVersion: NET.manifestVersion,
+    actors: G.actors.map(netPackCheckpointActor),
+    /* The unchanged relay validates the legacy checkpoint event list itself.
+       Keeping v8 confirm feedback beside that list lets the relay forward it
+       into migration without mistaking a new display event for bad state. */
+    events: NET.eventQueue.filter(event => event.kind !== 'confirm'),
+    confirmEvents: NET.eventQueue.filter(event => event.kind === 'confirm')
+  });
+}
+
+function netFlushEvents() {
+  if (!NET.eventQueue.length) return;
+  const events = NET.eventQueue.splice(0, NET.eventQueue.length);
+  netSend({
+    t: 'event',
+    v: NETP.VERSION,
+    authorityEpoch: NET.authorityEpoch,
+    round: NET.round,
+    events: events
+  });
+}
+
+function netRecordActorHistory() {
+  const cutoff = G.time - NETP.MAX_REWIND_SECONDS;
+  for (const a of G.actors) {
+    if (!a.netHistory) a.netHistory = [];
+    const history = a.netHistory;
+    const sample = {
+      time: G.time,
+      pos: [a.pos.x, a.pos.y, a.pos.z],
+      alive: !!a.alive
+    };
+    if (history.length && history[history.length - 1].time === G.time)
+      history[history.length - 1] = sample;
+    else
+      history.push(sample);
+
+    /* Keep the sample just before the cutoff so interpolation at the edge is
+       still defined, then impose a hard cap in case simulation cadence changes. */
+    while (history.length > 2 && history[1].time < cutoff) history.shift();
+    if (history.length > NET_MAX_HISTORY_SAMPLES)
+      history.splice(0, history.length - NET_MAX_HISTORY_SAMPLES);
+  }
+}
+
+function netHistoryStateAt(history, time) {
+  if (!history || !history.length || time < history[0].time) return null;
+  const selected = NETP.selectTimedSamples(history, time, 0);
+  if (!selected) return null;
+  const from = history[selected.from], to = history[selected.to];
+  const alpha = selected.alpha;
+  return {
+    pos: [
+      lerp(from.pos[0], to.pos[0], alpha),
+      lerp(from.pos[1], to.pos[1], alpha),
+      lerp(from.pos[2], to.pos[2], alpha)
+    ],
+    alive: alpha >= 1 ? to.alive : from.alive
+  };
+}
+
+/* The furthest back this guest could honestly be asking to see: half the round
+   trip the relay measured, plus the deepest interpolation buffer the protocol
+   allows, plus slack. The round trip is the load-bearing part, and it is the
+   relay's number rather than the guest's -- a guest cannot buy a longer look
+   backwards by claiming to be further away, because it does not author the
+   claim. Without one (an older relay, or before the first pong) this falls
+   back to the flat protocol bound and only the smoothing does any work. */
+function netLagOffsetCeiling(actor) {
+  const measured = actor.netRelayRttMs;
+  if (!Number.isFinite(measured) || measured <= 0) return NETP.MAX_REWIND_SECONDS;
+  return Math.min(NETP.MAX_REWIND_SECONDS,
+    measured / 2000 +
+    NET_SNAPSHOT_INTERVAL * NETP.MAX_INTERP_SNAPSHOTS +
+    NET_LAG_OFFSET_SLACK);
+}
+
+function netTrackLagOffset(actor, input) {
+  /* Zero is not a small offset, it is a guest that has not synchronised to the
+     host's clock yet -- netGuestRenderTime returns it until the first snapshot
+     lands. Seeding an estimate from those would start every guest at the
+     ceiling and spend the first third of a second rewinding honest shots
+     further back than they asked for. */
+  if (!input || !Number.isFinite(input.renderTime) || input.renderTime <= 0) return;
+  const observed = clamp(G.time - input.renderTime, 0, netLagOffsetCeiling(actor));
+  /* Slow on purpose. It has to follow a connection that genuinely changes, and
+     it must not follow a guest walking its own offset outwards a millisecond at
+     a time -- the ceiling is what stops that, and this decides how long the
+     walk takes to be worth attempting. */
+  actor.netLagOffset = Number.isFinite(actor.netLagOffset)
+    ? lerp(actor.netLagOffset, observed, NET_LAG_OFFSET_SMOOTHING)
+    : observed;
+}
+
+/* Hold the requested rewind near what this guest has actually been running at.
+   Clamped rather than refused: a rejected rewind is a shot that quietly does
+   not count, and on the one occasion the estimate is wrong that would be an
+   honest player's shot. */
+function netNarrowRewind(shooter, renderTime) {
+  if (!Number.isFinite(shooter.netLagOffset) || !Number.isFinite(renderTime))
+    return renderTime;
+  const low = Math.max(0, shooter.netLagOffset - NET_LAG_OFFSET_TOLERANCE);
+  const high = Math.max(low, Math.min(netLagOffsetCeiling(shooter),
+    shooter.netLagOffset + NET_LAG_OFFSET_TOLERANCE));
+  return G.time - clamp(G.time - renderTime, low, high);
+}
+
+function netBeginLagCompensation(shooter, renderTime) {
+  if (!netIsHost() || shooter.controller !== 'remote' ||
+      !shooter.netHistory || !shooter.netHistory.length) return null;
+  /* The client chooses this timestamp, so malformed, future, and older-than-
+     history requests get no rewind at all; a guest never gets an arbitrary
+     trip through match history. */
+  const rewindTime = NETP.clampRewindTime(
+    netNarrowRewind(shooter, renderTime), G.time, shooter.netHistory[0].time,
+    NETP.MAX_REWIND_SECONDS);
+  if (rewindTime === null) return null;
+
+  const saved = [];
+  const restore = () => {
+    for (const state of saved) {
+      state.actor.pos.x = state.x;
+      state.actor.pos.y = state.y;
+      state.actor.pos.z = state.z;
+      state.actor.alive = state.alive;
+    }
+    saved.length = 0;
+  };
+
+  try {
+    for (const actor of G.actors) {
+      if (actor === shooter) continue;
+      const past = netHistoryStateAt(actor.netHistory, rewindTime);
+      if (!past) continue;
+      saved.push({
+        actor: actor,
+        x: actor.pos.x, y: actor.pos.y, z: actor.pos.z,
+        alive: actor.alive
+      });
+      actor.pos.x = past.pos[0];
+      actor.pos.y = past.pos[1];
+      actor.pos.z = past.pos[2];
+      actor.alive = past.alive;
+    }
+  } catch (error) {
+    restore();
+    throw error;
+  }
+
+  return saved.length ? restore : null;
+}
+
+function netAfterSimulation(dt, force) {
+  /* Once per simulated tick, so the host consumes input at exactly the rate
+     the guest predicted with. */
+  if (netIsGuest() && NET.phase === 'playing') netSendInput();
+  if (netIsHost() && NET.phase === 'playing') netRecordActorHistory();
+  if (!netIsHost() || NET.phase !== 'playing' || !netSocketOpen()) return;
+  NET.snapshotAcc += dt;
+  NET.checkpointAcc += dt;
+  NET.eventAcc += dt;
+
+  if (force || NET.snapshotAcc >= NET_SNAPSHOT_INTERVAL) {
+    NET.snapshotAcc = force ? 0 : NET.snapshotAcc % NET_SNAPSHOT_INTERVAL;
+    netSend({
+      t: 'snapshot',
+      v: NETP.VERSION,
+      authorityEpoch: NET.authorityEpoch,
+      round: NET.round,
+      tick: G.tick,
+      time: G.time,
+      mode: G.mode,
+      map: netActiveMapId(),
+      eventSeq: NET.eventSeq,
+      manifestVersion: NET.manifestVersion,
+      actors: G.actors.map(netPackActor),
+      donuts: netPackDonuts(),
+      over: !!G.over,
+      winner: G.winner ? netActorId(G.winner) : null
+    }, !force);
+  }
+
+  if (force || NET.checkpointDirty || NET.checkpointAcc >= NET_CHECKPOINT_INTERVAL) {
+    NET.checkpointAcc = force ? 0 : NET.checkpointAcc % NET_CHECKPOINT_INTERVAL;
+    if (netSendCheckpoint()) NET.checkpointDirty = false;
+  }
+
+  /* Events used to leave only when a snapshot did, which put up to a whole
+     snapshot interval between a guest's shot landing and its owner being told.
+     They carry the hit feedback, so that wait was pure dead air on top of the
+     round trip. Flushing them on their own clock spends a few more messages to
+     get it back -- but not one per 60Hz tick: the relay closes a peer that
+     exceeds 90 messages a second and snapshots already claim 20 of those. */
+  if (force || NET.eventAcc >= NET_EVENT_INTERVAL) {
+    NET.eventAcc = force ? 0 : NET.eventAcc % NET_EVENT_INTERVAL;
+    netFlushEvents();
+  }
+}
+
+/* How far behind the host's clock the guest renders everybody else.
+
+   This used to be a flat two snapshot intervals -- 100ms at 20Hz, paid in full
+   whether the connection needed it or not. It is not free: it is 100ms of
+   extra reaction time handed to the host in every fight, on top of the
+   latency, and lag compensation does nothing about it because the guest is
+   still seeing the enemy late. The buffer only has to cover one interval plus
+   however unevenly snapshots are actually arriving, so that is what it now
+   costs. On a steady connection this is roughly 58ms instead of 100ms. */
+function netInterpDelay() {
+  return NETP.interpolationDelay(NET.snapshotInterval, NET.arrivalJitter);
+}
+
+function netGuestRenderTime(nowSeconds) {
+  if (!NET.hostClockAt) return 0;
+  const hostClock = NET.hostClock + Math.max(0, nowSeconds - NET.hostClockAt);
+  return Math.max(0, hostClock - netInterpDelay());
+}
+
+function netObserveInputAck(ack) {
+  if (!Number.isSafeInteger(ack) || ack <= NET.lastInputAck) return;
+  const sentAt = NET.inputSentTimes.get(ack);
+  if (Number.isFinite(sentAt)) {
+    const roundTrip = performance.now() / 1000 - sentAt;
+    if (roundTrip >= 0 && roundTrip <= 2) {
+      const sample = roundTrip * 0.5;
+      NET.oneWay = NET.oneWay > 0 ? lerp(NET.oneWay, sample, 0.2) : sample;
+    }
+  }
+  NET.lastInputAck = ack;
+  for (const seq of NET.inputSentTimes.keys()) {
+    if (seq <= ack) NET.inputSentTimes.delete(seq);
+  }
+}
+
+function netDisplayedRenderTime() {
+  return NET.renderTime;
+}
+
+/* Render-rate work only. Input used to be sent from here, gated to 33ms, which
+   made it a sample of the player's intent taken on the display's clock rather
+   than the simulation's. Two consequences, both paid by the guest: up to 33ms
+   of dead time before anything was sent -- the residue that still loses a duel
+   81/19 on a 5ms LAN, where the network is nearly free -- and an input stream
+   the host consumed at a different rate than the guest predicted with, which
+   makes an exact replay impossible. Sending is now netSendInput, once per
+   simulation tick. */
+function netFrame(now) {
+  if (!netIsGuest() || NET.phase !== 'playing' || !G.player || !netSocketOpen()) return;
+  NET.renderTime = netGuestRenderTime(now / 1000);
+}
+
+function netSendInput() {
+  if (!netIsGuest() || NET.phase !== 'playing' || !G.player || !netSocketOpen()) return;
+  const now = performance.now();
+  const displayedRenderTime = NET.renderTime;
+  const active = G.started && !G.paused && !G.over && G.player.alive;
+  const p = G.player;
+  const edgePending = IN.fireSeq > NET.lastFireSeqSent;
+  const inputRenderTime = edgePending && Number.isFinite(IN.fireRenderTime)
+    ? IN.fireRenderTime
+    : displayedRenderTime;
+  const seq = ++NET.inputSeq;
+  /* Read through the same function the local simulation uses. These two used
+     to read KEY/IN separately, so what the guest predicted and what it told
+     the host it did were two hand-maintained transcriptions of one intent --
+     and any drift between them showed up as the local player being corrected
+     for input it thought it had sent. */
+  const inp = readLocalInput(active);
+  const message = {
+    t: 'input',
+    v: NETP.VERSION,
+    authorityEpoch: NET.authorityEpoch,
+    round: NET.round,
+    seq: seq,
+    fwd: inp.fwd,
+    strafe: inp.strafe,
+    jump: inp.jump,
+    sprint: inp.sprint,
+    fire: inp.fire,
+    fireSeq: IN.fireSeq,
+    weaponSeq: NET.weaponSeq,
+    reloadSeq: IN.reloadSeq,
+    yaw: p.yaw,
+    pitch: p.pitch,
+    renderTime: inputRenderTime,
+    weapon: p.weapon
+  };
+  if (netSend(message)) {
+    NET.lastFireSeqSent = IN.fireSeq;
+    NET.inputSentTimes.set(seq, now / 1000);
+    if (NET.inputSentTimes.size > 64)
+      NET.inputSentTimes.delete(NET.inputSentTimes.keys().next().value);
+  }
+  /* Stamp the step this tick predicted with the sequence that carried it, so
+     reconciliation knows which steps the host has already accounted for. */
+  for (let i = NET.pendingSteps.length - 1; i >= 0; i--) {
+    if (NET.pendingSteps[i].seq !== null) break;
+    NET.pendingSteps[i].seq = seq;
+  }
+}
+
+/* One entry per simulated tick, holding the intent that tick was given. The
+   struct is readLocalInput's, unchanged, so a replay feeds applyMovement
+   exactly what the live step fed it. */
+function netRecordPredictedStep(input, dt) {
+  if (!netIsGuest() || NET.phase !== 'playing') return;
+  NET.pendingSteps.push({
+    seq: null,
+    dt: dt,
+    input: {
+      fwd: input.fwd, strafe: input.strafe,
+      jump: input.jump, sprint: input.sprint, fire: input.fire
+    }
+  });
+  if (NET.pendingSteps.length > NET_MAX_PENDING_STEPS)
+    NET.pendingSteps.splice(0, NET.pendingSteps.length - NET_MAX_PENDING_STEPS);
+}
+
+/* Reconciliation by replay.
+
+   What this replaces damped the local player 16% of the way toward the
+   authoritative state on every snapshot. That state describes where the guest
+   was a full round trip ago, so the controller's fixed point is e = -v*RTT: it
+   converges on cancelling the prediction outright, and the guest ends up
+   rendered where the host thought it was ~190ms earlier. Correct velocity, so
+   it does not feel slow -- it feels floaty, and releasing a key slides you
+   about a metre past where you stopped.
+
+   Replay instead: take the authoritative state, re-apply every input the host
+   has not acknowledged yet, and land where those inputs actually put you. When
+   prediction was right the result equals what was already on screen and
+   nothing moves. Only genuine mispredictions produce a correction. */
+function netReconcilePlayer(a, s) {
+  const steps = NET.pendingSteps;
+  let kept = 0;
+  while (kept < steps.length && steps[kept].seq !== null && steps[kept].seq <= s.ack) kept++;
+  if (kept > 0) steps.splice(0, kept);
+
+  const shownX = a.pos.x, shownY = a.pos.y, shownZ = a.pos.z;
+
+  a.pos.x = s.pos[0]; a.pos.y = s.pos[1]; a.pos.z = s.pos[2];
+  a.vel.x = s.vel[0]; a.vel.y = s.vel[1]; a.vel.z = s.vel[2];
+  a.onGround = !!s.onGround;
+
+  for (const step of steps) applyMovement(a, step.input, step.dt);
+
+  const residual = Math.hypot(a.pos.x - shownX, a.pos.y - shownY, a.pos.z - shownZ);
+  /* A replay that lands somewhere far from the screen is a teleport -- a
+     respawn, or a correction after a long stall -- not a misprediction to ease
+     into. Take it as-is. Below that, ease the last of it out over a few frames
+     so a small disagreement is not a visible flick; the offset is applied to
+     the predicted result rather than to the authority, so it delays only the
+     appearance of the correction and never the correction itself. */
+  if (residual > 0.02 && residual <= NET_SNAP_DISTANCE) {
+    a.pos.x = lerp(a.pos.x, shownX, NET_RESIDUAL_SMOOTHING);
+    a.pos.y = lerp(a.pos.y, shownY, NET_RESIDUAL_SMOOTHING);
+    a.pos.z = lerp(a.pos.z, shownZ, NET_RESIDUAL_SMOOTHING);
+  }
+  return residual;
+}
+
+function netFiniteIn(value, min, max) {
+  return Number.isFinite(value) && value >= min && value <= max;
+}
+
+function netSafeCount(value) {
+  return Number.isSafeInteger(value) && value >= 0 && value <= 1_000_000;
+}
+
+function netValidDonutState(donut) {
+  const b = MAP.bounds;
+  const actorId = value => Number.isSafeInteger(value) && value > 0 && value <= 100_000;
+  const netId = value => typeof value === 'string' && value.length > 0 && value.length <= 80;
+  const actorRef = (id, identity) =>
+    (id === null && identity === null) || (actorId(id) && netId(identity));
+  return !!(donut && typeof donut === 'object' && !Array.isArray(donut) &&
+    Number.isSafeInteger(donut.id) && donut.id > 0 && donut.id <= 1_000_000 &&
+    actorRef(donut.owner, donut.ownerNetId) &&
+    actorRef(donut.killer, donut.killerNetId) &&
+    netFiniteIn(donut.x, b.minX - 3, b.maxX + 3) &&
+    netFiniteIn(donut.y, -2, 20) &&
+    netFiniteIn(donut.z, b.minZ - 3, b.maxZ + 3) &&
+    netFiniteIn(donut.t, 0, DONUT_LIFETIME));
+}
+
+function netValidSnapshot(message) {
+  if (!message || typeof message !== 'object' || Array.isArray(message) ||
+      message.t !== 'snapshot' || message.v !== NETP.VERSION ||
+      !NETP.isAuthorityEpoch(message.authorityEpoch) ||
+      !Number.isSafeInteger(message.round) || message.round < 1 ||
+      !Number.isSafeInteger(message.tick) || message.tick < 0 ||
+      !netFiniteIn(message.time, 0, 100_000_000) ||
+      !Number.isSafeInteger(message.eventSeq) || message.eventSeq < 0 ||
+      !Number.isSafeInteger(message.manifestVersion) || message.manifestVersion < 1 ||
+      (message.mode !== 'dm' && message.mode !== 'kc') ||
+      message.map !== netActiveMapId() ||
+      typeof message.over !== 'boolean' ||
+      !Array.isArray(message.actors) || message.actors.length < 1 ||
+      message.actors.length > 16 ||
+      !Array.isArray(message.donuts) || message.donuts.length > DONUT_MAX ||
+      (message.mode === 'dm' && message.donuts.length > 0)) return false;
+
+  const netIds = new Set();
+  const actorIds = new Map();
+  for (const actor of message.actors) {
+    if (!netValidActorState(actor) || netIds.has(actor.netId) || actorIds.has(actor.id))
+      return false;
+    netIds.add(actor.netId);
+    actorIds.set(actor.id, actor.netId);
+  }
+  const donutIds = new Set();
+  for (const donut of message.donuts) {
+    if (!netValidDonutState(donut) || donutIds.has(donut.id) ||
+        (donut.owner !== null && actorIds.get(donut.owner) !== donut.ownerNetId) ||
+        (donut.killer !== null && actorIds.get(donut.killer) !== donut.killerNetId)) return false;
+    donutIds.add(donut.id);
+  }
+  if (message.winner !== null &&
+      (typeof message.winner !== 'string' || !netIds.has(message.winner))) return false;
+  return !message.over || typeof message.winner === 'string';
+}
+
+function netValidCheckpoint(message) {
+  if (!message || typeof message !== 'object' || Array.isArray(message) ||
+      message.t !== 'checkpoint' || message.v !== NETP.VERSION ||
+      !Number.isSafeInteger(message.tick) || message.tick < 0 ||
+      !netFiniteIn(message.time, 0, 100_000_000) ||
+      (message.mode !== 'dm' && message.mode !== 'kc') ||
+      message.map !== netActiveMapId() ||
+      !Number.isSafeInteger(message.manifestVersion) || message.manifestVersion < 1 ||
+      !Array.isArray(message.actors) || message.actors.length < 1 ||
+      message.actors.length > 16 ||
+      !Array.isArray(message.events) || message.events.length > 128 ||
+      !Array.isArray(message.confirmEvents) || message.confirmEvents.length > 128) return false;
+  const ids = new Set();
+  for (const actor of message.actors) {
+    if (!actor || typeof actor !== 'object' || Array.isArray(actor) ||
+        typeof actor.netId !== 'string' || !actor.netId || actor.netId.length > 80 ||
+        ids.has(actor.netId) ||
+        !['local', 'remote', 'bot'].includes(actor.controller) ||
+        typeof actor.human !== 'boolean' ||
+        (actor.human ? actor.controller === 'bot' : actor.controller !== 'bot') ||
+        !['easy', 'normal', 'hard'].includes(actor.skill) ||
+        !actor.ammoBy || typeof actor.ammoBy !== 'object' ||
+        Array.isArray(actor.ammoBy)) return false;
+    const weapons = Object.keys(actor.ammoBy);
+    if (weapons.length > NETP.ALLOWED_WEAPONS.length ||
+        weapons.some(weapon => !NETP.ALLOWED_WEAPONS.includes(weapon))) return false;
+    for (const weapon of weapons) {
+      const ammo = actor.ammoBy[weapon];
+      if (!Array.isArray(ammo) || ammo.length !== 2 ||
+          !netSafeCount(ammo[0]) || !netSafeCount(ammo[1])) return false;
+    }
+    ids.add(actor.netId);
+  }
+  return message.events.every(event => event.kind !== 'confirm' && netValidEvent(event, ids)) &&
+    message.confirmEvents.every(event => event.kind === 'confirm' && netValidEvent(event, ids));
+}
+
+function netValidActorState(s) {
+  const b = MAP.bounds;
+  return !!(s && typeof s === 'object' && !Array.isArray(s) &&
+    Number.isSafeInteger(s.id) && s.id > 0 && s.id <= 100_000 &&
+    typeof s.netId === 'string' && s.netId.length > 0 && s.netId.length <= 80 &&
+    typeof s.name === 'string' && !!NETP.cleanPlayerName(s.name) &&
+    typeof s.human === 'boolean' &&
+    s.colors && typeof s.colors === 'object' && !Array.isArray(s.colors) &&
+    Number.isSafeInteger(s.colors.body) && s.colors.body >= 0 && s.colors.body <= 0xffffff &&
+    Number.isSafeInteger(s.colors.trim) && s.colors.trim >= 0 && s.colors.trim <= 0xffffff &&
+    typeof s.colors.name === 'string' && s.colors.name.length <= 40 &&
+    Array.isArray(s.pos) && s.pos.length === 3 &&
+    netFiniteIn(s.pos[0], b.minX - 3, b.maxX + 3) &&
+    netFiniteIn(s.pos[1], -2, 20) &&
+    netFiniteIn(s.pos[2], b.minZ - 3, b.maxZ + 3) &&
+    Array.isArray(s.vel) && s.vel.length === 3 &&
+    s.vel.every(value => netFiniteIn(value, -80, 80)) &&
+    netFiniteIn(s.yaw, -100, 100) && netFiniteIn(s.pitch, -2, 2) &&
+    netFiniteIn(s.aimYaw, -100, 100) && netFiniteIn(s.aimPitch, -2, 2) &&
+    netFiniteIn(s.bodyYaw, -100, 100) &&
+    typeof s.onGround === 'boolean' && typeof s.aiming === 'boolean' &&
+    netFiniteIn(s.health, 0, 500) && netFiniteIn(s.maxHealth, 1, 500) &&
+    typeof s.alive === 'boolean' &&
+    netFiniteIn(s.deathT, 0, 60) && netFiniteIn(s.respawnT, 0, 60) &&
+    netFiniteIn(s.shield, 0, 60) && !!WBY[s.weapon] &&
+    netSafeCount(s.ammo) && netSafeCount(s.reserve) &&
+    netFiniteIn(s.reloadT, 0, 60) &&
+    Number.isSafeInteger(s.ack) && s.ack >= 0 &&
+    Number.isSafeInteger(s.weaponSeq) && s.weaponSeq >= 0 &&
+    netSafeCount(s.kills) && netSafeCount(s.deaths) &&
+    netSafeCount(s.confirms) &&
+    netSafeCount(s.streak) && netSafeCount(s.bestStreak) &&
+    (s.lastHitBy === null ||
+      (Number.isSafeInteger(s.lastHitBy) && s.lastHitBy > 0 &&
+       s.lastHitBy <= 100_000)));
+}
+
+function netCreateReplica(s) {
+  const colors = { body: s.colors.body, trim: s.colors.trim, name: s.colors.name };
+  const cosmetics = netCleanCosmetics(s.cosmetics);
+  const a = makeActor({
+    id: Number.isInteger(s.id) ? s.id : undefined,
+    netId: s.netId,
+    name: NETP.cleanPlayerName(s.name),
+    controller: 'replica',
+    isHuman: !!s.human,
+    colors: colors,
+    weapon: s.weapon
+  });
+  a.cosmetics = cosmetics;
+  a.pos.x = s.pos[0]; a.pos.y = s.pos[1]; a.pos.z = s.pos[2];
+  a.vel.x = s.vel[0]; a.vel.y = s.vel[1]; a.vel.z = s.vel[2];
+  a.yaw = s.yaw; a.aimYaw = s.aimYaw; a.aimPitch = s.aimPitch; a.bodyYaw = s.bodyYaw;
+  a.netSamples = [];
+  attachCharacter(a);
+  G.actors.push(a);
+  return a;
+}
+
+function netReconcileDonuts(states) {
+  const incoming = new Map(states.map(state => [state.id, state]));
+  for (let i = G.donuts.length - 1; i >= 0; i--)
+    if (!incoming.has(G.donuts[i].id)) removeDonut(i);
+
+  let nextId = 1;
+  for (const state of states) {
+    let donut = G.donuts.find(item => item.id === state.id);
+    const fresh = !donut;
+    if (!donut) donut = {};
+    donut.id = state.id;
+    donut.owner = state.owner;
+    donut.killer = state.killer;
+    donut.ownerNetId = state.ownerNetId;
+    donut.killerNetId = state.killerNetId;
+    donut.x = state.x;
+    donut.y = state.y;
+    donut.z = state.z;
+    donut.t = state.t;
+    if (fresh) {
+      G.donuts.push(donut);
+      showDonutVisual(donut);
+    }
+    nextId = Math.max(nextId, donut.id + 1);
+  }
+  G.nextDonutId = nextId;
+}
+
+function netPushReplicaSample(a, s, sampleTime) {
+  if (!Number.isFinite(sampleTime)) return;
+  if (!a.netSamples) a.netSamples = [];
+  const samples = a.netSamples;
+  const previous = samples[samples.length - 1];
+  const sample = {
+    time: sampleTime,
+    pos: s.pos.slice(),
+    vel: s.vel.slice(),
+    yaw: s.yaw,
+    pitch: s.pitch,
+    aimYaw: s.aimYaw,
+    aimPitch: s.aimPitch,
+    bodyYaw: s.bodyYaw
+  };
+
+  if (previous) {
+    const jump = Math.hypot(
+      sample.pos[0] - previous.pos[0],
+      sample.pos[1] - previous.pos[1],
+      sample.pos[2] - previous.pos[2]);
+    /* A teleport is not motion to smooth. Throw away the old timeline so it
+       cannot drag a respawn or rejoin across the map for several frames. */
+    if (jump > 6) {
+      samples.length = 0;
+      a.pos.x = sample.pos[0]; a.pos.y = sample.pos[1]; a.pos.z = sample.pos[2];
+    }
+  }
+
+  if (samples.length && samples[samples.length - 1].time === sampleTime)
+    samples[samples.length - 1] = sample;
+  else
+    samples.push(sample);
+  if (samples.length > NET_MAX_REPLICA_SAMPLES)
+    samples.splice(0, samples.length - NET_MAX_REPLICA_SAMPLES);
+}
+
+function netApplyActorState(a, s, local, sampleTime) {
+  const wasAlive = a.alive;
+  const oldHp = a.health;
+  const oldWeapon = a.weapon;
+  netSetActorCosmetics(a, s.cosmetics);
+  a.name = NETP.cleanPlayerName(s.name);
+  a.maxHealth = clamp(s.maxHealth, 1, 500);
+  a.health = clamp(s.health, 0, a.maxHealth);
+  a.alive = !!s.alive;
+  a.respawnT = Math.max(0, s.respawnT || 0);
+  a.shield = Math.max(0, s.shield || 0);
+  a.onGround = !!s.onGround;
+  a.aiming = !!s.aiming;
+  const applyWeaponState = !local ||
+    NETP.isWeaponStateAcknowledged(NET.weaponSeq, s.weaponSeq);
+  if (applyWeaponState) {
+    a.weapon = WBY[s.weapon] ? s.weapon : a.weapon;
+    a.ammo = Math.max(0, Math.floor(s.ammo || 0));
+    a.reserve = Math.max(0, Math.floor(s.reserve || 0));
+    a.reloadT = Math.max(0, s.reloadT || 0);
+  }
+  a.kills = Math.max(0, Math.floor(s.kills || 0));
+  a.deaths = Math.max(0, Math.floor(s.deaths || 0));
+  a.confirms = Math.max(0, Math.floor(s.confirms || 0));
+  a.streak = Math.max(0, Math.floor(s.streak || 0));
+  a.bestStreak = Math.max(0, Math.floor(s.bestStreak || 0));
+
+  if (local) {
+    netObserveInputAck(s.ack);
+    if (Number.isInteger(s.id)) a.id = s.id;
+    NET.lastResidual = netReconcilePlayer(a, s);
+    if (oldWeapon !== a.weapon) vmSetWeapon(a.weapon);
+    if (wasAlive && !a.alive) {
+      const killer = G.actors.find(x => x.netId === NET.lastKillerId);
+      showDeadScreen(killer || null);
+    } else if (!wasAlive && a.alive) {
+      hideDeadScreen();
+      SFX.spawn();
+      setDamageDirsCleared();
+      /* A guest's own respawn never runs respawnActor -- the snapshot is what
+         brings it back -- so the per-weapon store has to be topped up here or
+         switching after a respawn predicts the magazine it died with. The held
+         weapon keeps what the host just said it has. */
+      refillAmmoStore(a);
+      a._ammoBy[a.weapon] = { ammo: a.ammo, reserve: a.reserve };
+      vmCancelReload();
+    }
+  } else {
+    netPushReplicaSample(a, s, sampleTime);
+    if (wasAlive && !a.alive) {
+      a.deathT = 0; a.deathDir = rng() < 0.5 ? -1 : 1;
+      if (a.plate) a.plate.sprite.visible = false;
+    } else if (!wasAlive && a.alive) {
+      a.deathT = 0; a.spawnT = 0.45;
+      if (a.plate) a.plate.sprite.visible = true;
+      if (a.char) { a.char.root.visible = true; a.char.root.scale.setScalar(0.001); }
+    }
+  }
+  if (a.plate && (oldHp !== a.health || wasAlive !== a.alive))
+    drawPlate(a.plate, a.name, a.health, a.maxHealth, a.colors.body);
+}
+
+function netApplySnapshot(msg) {
+  if (!netValidSnapshot(msg) || msg.tick <= NET.lastSnapshotTick) return;
+
+  const seen = new Set(msg.actors.map(state => state.netId));
+  if (!seen.has(NET.id)) return;
+  /* Read before the manifest is adopted below: on the first snapshot every
+     actor is new, and only afterwards does a new one mean somebody arrived. */
+  const firstSnapshot = !NET.actorManifest;
+  if (NET.actorManifest) {
+    if (msg.manifestVersion < NET.manifestVersion) return;
+    if (msg.manifestVersion === NET.manifestVersion) {
+      if (seen.size !== NET.actorManifest.size) return;
+      for (const id of seen) if (!NET.actorManifest.has(id)) return;
+    } else {
+      NET.actorManifest = new Set(seen);
+      NET.manifestVersion = msg.manifestVersion;
+    }
+  } else {
+    NET.actorManifest = new Set(seen);
+    NET.manifestVersion = msg.manifestVersion;
+  }
+  if (msg.over &&
+      (typeof msg.winner !== 'string' || !NET.actorManifest.has(msg.winner))) return;
+
+  NET.lastSnapshotTick = msg.tick;
+  NET.lastRawSnapshot = msg;
+  if (NET.lastSnapshotTime >= 0) {
+    const interval = msg.time - NET.lastSnapshotTime;
+    if (interval >= NET_SNAPSHOT_INTERVAL * 0.5 && interval <= NET_SNAPSHOT_INTERVAL * 4)
+      NET.snapshotInterval = lerp(NET.snapshotInterval, interval, 0.2);
+  }
+  /* Sized off arrival, not off send: the host's cadence is regular by
+     construction, and what the buffer has to absorb is the network making it
+     irregular. Measured on the wall clock for that reason -- msg.time is the
+     host's schedule and would report a steady stream however late it landed. */
+  {
+    const arrivedAt = performance.now() / 1000;
+    if (NET.lastSnapshotAt > 0) {
+      NET.arrivalJitter = NETP.trackArrivalJitter(
+        NET.arrivalJitter, arrivedAt - NET.lastSnapshotAt, NET.snapshotInterval);
+    }
+    NET.lastSnapshotAt = arrivedAt;
+  }
+  NET.lastSnapshotTime = msg.time;
+  G.time = lerp(G.time, msg.time, 0.16);
+
+  for (const s of msg.actors) {
+    let a;
+    if (s.netId === NET.id) {
+      a = G.player;
+      a.netId = NET.id;
+    } else {
+      a = G.actors.find(x => x.netId === s.netId);
+      if (!a) {
+        a = netCreateReplica(s);
+        /* A body appearing out of nowhere reads as a bug unless it is named.
+           Bots only ever arrive with the first snapshot, so this is a person. */
+        if (!firstSnapshot && s.human) showHint(a.name + ' DROPPED IN');
+      }
+    }
+    netApplyActorState(a, s, a === G.player, msg.time);
+  }
+  NET.hostClock = msg.time + NET.oneWay;
+  NET.hostClockAt = performance.now() / 1000;
+  for (const a of G.actors.slice()) {
+    if (!a.isPlayer && !seen.has(a.netId)) detachActor(a);
+  }
+  setGameMode(msg.mode);
+  netReconcileDonuts(msg.donuts);
+
+  const sig = G.mode + '|' + G.actors.map(a =>
+    a.netId + ':' + a.kills + ':' + a.deaths + ':' + a.confirms + ':' + a.bestStreak).join('|');
+  if (sig !== NET.scoreSignature) {
+    NET.scoreSignature = sig;
+    refreshBoard();
+  }
+  if (msg.over) netShowRemoteMatchOver(msg.winner);
+}
+
+function netStepReplica(a, dt) {
+  const samples = a.netSamples;
+  const selected = NETP.selectTimedSamples(
+    samples, NET.renderTime, netInterpDelay());
+  if (!selected) return;
+  const from = samples[selected.from], to = samples[selected.to];
+  const alpha = selected.alpha, extra = selected.extrapolation;
+  const targetPos = [
+    lerp(from.pos[0], to.pos[0], alpha) + to.vel[0] * extra,
+    lerp(from.pos[1], to.pos[1], alpha) + to.vel[1] * extra,
+    lerp(from.pos[2], to.pos[2], alpha) + to.vel[2] * extra
+  ];
+  a.pos.x = targetPos[0]; a.pos.y = targetPos[1]; a.pos.z = targetPos[2];
+  a.vel.x = lerp(from.vel[0], to.vel[0], alpha);
+  a.vel.y = lerp(from.vel[1], to.vel[1], alpha);
+  a.vel.z = lerp(from.vel[2], to.vel[2], alpha);
+  a.yaw = NETP.lerpAngle(from.yaw, to.yaw, alpha);
+  a.pitch = lerp(from.pitch, to.pitch, alpha);
+  a.aimYaw = NETP.lerpAngle(from.aimYaw, to.aimYaw, alpha);
+  a.aimPitch = lerp(from.aimPitch, to.aimPitch, alpha);
+  a.bodyYaw = NETP.lerpAngle(from.bodyYaw, to.bodyYaw, alpha);
+}
+
+function netSendEvent(kind, data) {
+  if (!netIsHost() || NET.phase !== 'playing') return;
+  if (NET.eventQueue.length >= 128) {
+    const expendable = NET.eventQueue.findIndex(event =>
+      event.kind === 'shot' || event.kind === 'shield');
+    NET.eventQueue.splice(expendable >= 0 ? expendable : 0, 1);
+  }
+  NET.eventQueue.push(Object.assign({ id: ++NET.eventSeq, kind: kind }, data || {}));
+}
+
+function netOnAuthoritativeShot(a, w, lines) {
+  netSendEvent('shot', { from: netActorId(a), weapon: w.id, lines: lines });
+}
+/* The shot sequence rides along so the guest that fired can tell which of its
+   predicted hits this answers. Only a remote shooter's own shots are keyed;
+   anything else sends null and is simply shown on arrival. */
+function netShotSeq(fireSeq) {
+  return Number.isSafeInteger(fireSeq) && fireSeq >= 0 ? fireSeq : null;
+}
+function netOnAuthoritativeShieldHit(target, from, x, y, z, fireSeq) {
+  netSendEvent('shield', {
+    target: netActorId(target), from: from ? netActorId(from) : null,
+    at: [x, y, z], seq: netShotSeq(fireSeq)
+  });
+}
+function netOnAuthoritativeDamage(target, from, damage, head, x, y, z, fireSeq) {
+  netSendEvent('damage', {
+    target: netActorId(target), from: from ? netActorId(from) : null,
+    damage: netRound(damage), head: !!head, at: [x, y, z], seq: netShotSeq(fireSeq)
+  });
+}
+/* Guest-side, display only. Nothing here touches health, kills or death --
+   those stay the host's to decide and arrive by snapshot. All this buys is the
+   round trip the player would otherwise spend staring at an unanswered shot. */
+function netPredictHit(target, dmg, head, x, y, z, fireSeq) {
+  if (!netIsGuest() || NET.phase !== 'playing' || !target) return;
+  /* A shielded target answers with a `shield` event and no damage, so
+     predicting a marker there would be a promise the host does not keep. The
+     shield is replicated and ticks down locally, so this is usually right; when
+     it is not, the shield event redeems the booking without showing anything. */
+  if (target.shield > 0) return;
+  if (!NETP.recordPredictedHit(NET.predictedHits, fireSeq, performance.now() / 1000)) return;
+  SFX.hit(!!head);
+  showHitmarker(!!head);
+  addFloater(head ? Math.round(dmg) + '!' : String(Math.round(dmg)),
+    x, y, z, head ? '#fff0a8' : '#ffffff', !!head);
+}
+
+/* True when the guest already showed this hit locally and the caller should
+   stay quiet. Unpredicted hits -- a shot the guest scored without knowing, or
+   any hit at all before this shipped -- still report normally. */
+function netHitAlreadyShown(e) {
+  return e.from === NET.id && e.seq !== null && e.seq !== undefined &&
+    NETP.consumePredictedHit(NET.predictedHits, e.seq, performance.now() / 1000);
+}
+
+function netOnAuthoritativeKill(target, from) {
+  netSendEvent('kill', {
+    target: netActorId(target), from: from ? netActorId(from) : null,
+    streak: from ? from.streak : 0
+  });
+}
+function netOnAuthoritativeConfirm(donut, collector, outcome) {
+  const owner = netPackDonutActor(donut.owner, donut.ownerNetId);
+  const killer = netPackDonutActor(donut.killer, donut.killerNetId);
+  netSendEvent('confirm', {
+    collector: netActorId(collector),
+    owner: owner.netId,
+    killer: killer.netId,
+    deny: outcome === 'DENIED',
+    at: [netRound(donut.x), netRound(donut.y), netRound(donut.z)]
+  });
+}
+function netOnAuthoritativeRespawn(a) {
+  netSendEvent('respawn', {
+    actor: netActorId(a), at: [a.pos.x, a.pos.y, a.pos.z],
+    color: a.colors.body
+  });
+}
+function netOnAuthoritativeMatchOver(winner) {
+  if (!netIsHost() || NET.phase !== 'playing') return;
+  netSendEvent('match-over', { winner: netActorId(winner) });
+  /* The winning simulation tick may be the last tick of the round. Send its
+     state and queued events immediately, before telling the relay the room is
+     back between rounds. WebSocket ordering makes this terminal update exact. */
+  netAfterSimulation(0, true);
+  netSend({
+    t: 'lobby',
+    v: NETP.VERSION,
+    authorityEpoch: NET.authorityEpoch,
+    round: NET.round,
+    winner: netActorId(winner)
+  });
+}
+
+function netKnownActor(value, manifest) {
+  const known = manifest || NET.actorManifest;
+  return typeof value === 'string' && known && known.has(value);
+}
+
+function netEventPoint(value) {
+  return Array.isArray(value) && value.length === 3 &&
+    value.every(component => netFiniteIn(component, -200, 200));
+}
+
+/* Absent is as valid as null. `seq` is additive, and tolerating its absence is
+   what keeps it from needing a protocol version of its own: a host that never
+   sends it still produces events this guest accepts, at the cost of the
+   deduplication only -- the feedback still arrives, it is just not matched to a
+   prediction. See the note on netHitAlreadyShown for what that costs. */
+function netValidShotSeq(value) {
+  return value === null || value === undefined || netSafeCount(value);
+}
+
+function netValidEvent(e, manifest) {
+  if (!e || typeof e !== 'object' || Array.isArray(e) ||
+      !Number.isSafeInteger(e.id) || e.id < 1 ||
+      typeof e.kind !== 'string') return false;
+  if (e.kind === 'shot') {
+    return netKnownActor(e.from, manifest) && !!WBY[e.weapon] &&
+      Array.isArray(e.lines) && e.lines.length <= 16 &&
+      e.lines.every(line => Array.isArray(line) && line.length === 6 &&
+        line.every(component => netFiniteIn(component, -200, 200)));
+  }
+  if (e.kind === 'shield') {
+    return netKnownActor(e.target, manifest) &&
+      (e.from === null || netKnownActor(e.from, manifest)) && netEventPoint(e.at) &&
+      netValidShotSeq(e.seq);
+  }
+  if (e.kind === 'damage') {
+    return netKnownActor(e.target, manifest) &&
+      (e.from === null || netKnownActor(e.from, manifest)) &&
+      netFiniteIn(e.damage, 0, 500) && typeof e.head === 'boolean' &&
+      netEventPoint(e.at) && netValidShotSeq(e.seq);
+  }
+  if (e.kind === 'kill') {
+    return netKnownActor(e.target, manifest) &&
+      (e.from === null || netKnownActor(e.from, manifest)) && netSafeCount(e.streak);
+  }
+  if (e.kind === 'confirm') {
+    return netKnownActor(e.collector, manifest) &&
+      (e.owner === null || netKnownActor(e.owner, manifest)) &&
+      (e.killer === null || netKnownActor(e.killer, manifest)) &&
+      typeof e.deny === 'boolean' && netEventPoint(e.at) &&
+      (e.deny ? e.owner !== null && e.collector === e.owner : e.collector !== e.owner);
+  }
+  if (e.kind === 'respawn') {
+    return netKnownActor(e.actor, manifest) && netEventPoint(e.at) &&
+      Number.isSafeInteger(e.color) && e.color >= 0 && e.color <= 0xffffff;
+  }
+  return e.kind === 'match-over' && netKnownActor(e.winner, manifest);
+}
+
+function netShowRemoteMatchOver(winnerId) {
+  if (!G.started) return;
+  const winner = G.actors.find(actor => actor.netId === winnerId);
+  if (!winner) return;
+  const first = !G.over;
+  G.over = true;
+  G.winner = winner;
+  G.paused = false;
+  document.getElementById('title').classList.add('off');
+  const dead = document.getElementById('dead');
+  dead.classList.add('off');
+  delete dead.dataset.wasUp;
+  showOverScreen(winner);
+  if (first && winner === G.player) SFX.win();
+  exitPointerLock();
+}
+
+function netApplyEvent(e) {
+  if (!netValidEvent(e) || e.id <= NET.lastEventSeq) return;
+  NET.lastEventSeq = e.id;
+  const from = e.from ? G.actors.find(a => a.netId === e.from) : null;
+  const target = e.target ? G.actors.find(a => a.netId === e.target) : null;
+
+  if (e.kind === 'shot') {
+    /* The guest already drew this shot from the same fireSeq-seeded spread.
+       Replaying its authoritative event would duplicate an identical tracer;
+       damage feedback still arrives only through the host's damage event. */
+    if (e.from === NET.id) return;
+    if (from) { from.recoil = 1; from.aiming = true; }
+    const w = WBY[e.weapon] || WBY.smg;
+    /* A guest never runs fireWeapon for a remote player -- this event IS the
+       shot as far as it is concerned -- so a guest watching its killer through
+       the killcam gets the viewmodel's kick from here rather than from the
+       hook in fireWeapon. */
+    if (from && from === KILLCAM.shown) vmFire(w);
+    if (Array.isArray(e.lines)) {
+      /* The shooter's own effect, from the cosmetics the relay approved for
+         them — never from anything inside the event, which the host wrote. */
+      const effectId = actorShotEffect(from);
+      for (let i = 0; i < e.lines.length; i++) {
+        const l = e.lines[i];
+        if (!Array.isArray(l) || l.length !== 6 || !l.every(Number.isFinite)) continue;
+        if (i === 0 || e.lines.length <= 3 || i % 3 === 0)
+          fxTracer(l[0], l[1], l[2], l[3], l[4], l[5],
+            C(from ? from.colors.trim : w.tracer), effectId);
+      }
+    }
+    if (from) SFX.shoot(w.id, from.pos.x, from.pos.y + 1.3, from.pos.z);
+  } else if (e.kind === 'shield') {
+    /* Redeem the booking even though nothing is drawn for it: the guest
+       predicted a hit the host turned into a shield ping, and leaving the
+       credit outstanding would let it swallow a later marker for this shot. */
+    netHitAlreadyShown(e);
+    if (target && Array.isArray(e.at)) fxShieldHit(target, e.at[0], e.at[1], e.at[2]);
+  } else if (e.kind === 'damage') {
+    if (e.from === NET.id && Array.isArray(e.at) && !netHitAlreadyShown(e)) {
+      SFX.hit(!!e.head);
+      showHitmarker(!!e.head);
+      addFloater(e.head ? Math.round(e.damage) + '!' : String(Math.round(e.damage)),
+        e.at[0], e.at[1], e.at[2], e.head ? '#fff0a8' : '#ffffff', !!e.head);
+    }
+    if (e.target === NET.id) {
+      SFX.hurt(); flashDamage(); fxShake(0.18);
+      if (from) addDamageDir(from);
+    }
+  } else if (e.kind === 'kill') {
+    if (target) addKillFeed(from, target);
+    if (e.from === NET.id && target) {
+      SFX.kill();
+      addFloater(G.mode === 'kc' ? 'کشتار' : '+۱', target.pos.x, target.pos.y + 1.6,
+        target.pos.z, '#b8f2d8', true);
+      if (e.streak >= 3) showHint(e.streak + ' IN A ROW!');
+    }
+    if (e.target === NET.id) NET.lastKillerId = e.from;
+  } else if (e.kind === 'confirm') {
+    const collector = G.actors.find(a => a.netId === e.collector);
+    const owner = e.owner ? G.actors.find(a => a.netId === e.owner) : collector;
+    const killer = e.killer ? G.actors.find(a => a.netId === e.killer) : null;
+    if (!collector || !owner) return;
+    const outcome = e.deny ? 'DENIED' :
+      (e.collector === e.killer ? 'CONFIRMED' : 'STOLEN');
+    renderDonutOutcome({ x: e.at[0], y: e.at[1], z: e.at[2] },
+      collector, owner, killer, outcome);
+  } else if (e.kind === 'respawn') {
+    if (e.actor === NET.id) return;
+    fxSpawnPuff(e.at[0], e.at[1], e.at[2], C(e.color));
+  } else if (e.kind === 'match-over') {
+    netShowRemoteMatchOver(e.winner);
+  }
+}
+
+function initNetworkUI() {
+  const name = document.getElementById('playerName');
+  const saveName = document.getElementById('savePlayerName');
+  const nameStatus = document.getElementById('lobbyNameStatus');
+  if (name) {
+    let saved = '';
+    try { saved = localStorage.getItem('pastel-nuketown-name') || ''; } catch (e) {}
+    name.value = NETP.cleanPlayerName(saved || 'بازیکن');
+    name.addEventListener('input', () => {
+      const cleaned = NETP.cleanPlayerName(name.value);
+      if (name.value !== cleaned) name.value = cleaned;
+      if (nameStatus) nameStatus.textContent = cleaned ? 'آماده بازی.' : 'یک نام وارد کنید.';
+    });
+  }
+  const saveLobbyName = () => {
+    const cleaned = NETP.cleanPlayerName(name && name.value);
+    if (!cleaned) {
+      if (nameStatus) nameStatus.textContent = 'یک نام وارد کنید.';
+      if (name) name.focus();
+      return;
+    }
+    if (name) name.value = cleaned;
+    try { localStorage.setItem('pastel-nuketown-name', cleaned); } catch (e) {}
+    if (NET.phase === 'lobby' && netSocketOpen()) {
+      if (!netSend({ t: 'rename', v: NETP.VERSION, name: cleaned })) {
+        if (nameStatus) nameStatus.textContent = 'ذخیره نام ناموفق بود.';
+        return;
+      }
+      const me = NET.members.find(member => member.id === NET.id);
+      if (me) me.name = cleaned;
+      netRenderRoster();
+    }
+    if (nameStatus) nameStatus.textContent = 'نام ثبت شد — آماده بازی هستید.';
+    if (typeof SFX === 'object' && SFX) SFX.ui();
+  };
+  if (saveName) saveName.addEventListener('click', saveLobbyName);
+  if (name) name.addEventListener('keydown', e => {
+    if (e.key === 'Enter') { e.preventDefault(); saveLobbyName(); }
+  });
+  const roomInput = document.getElementById('roomCode');
+  const invited = NETP.normalizeRoomCode(QS.get('room') || '');
+  if (roomInput && invited) roomInput.value = invited;
+
+  document.getElementById('quickPlay').addEventListener('click', () => {
+    SFX.init(); SFX.resume(); SFX.ui();
+    netQuickPlay();
+  });
+  document.getElementById('hostGame').addEventListener('click', () => {
+    roomsShow(false);
+    netConnect('create');
+  });
+  document.getElementById('joinGame').addEventListener('click', () => {
+    roomsShow(false);
+    netConnect('join', roomInput.value);
+  });
+
+  /* The three ways out of the browser, and the one way in. */
+  const roomsBtn = document.getElementById('roomsOpen');
+  const roomsClose = document.getElementById('roomsClose');
+  const roomsPanel = document.getElementById('rooms');
+  if (roomsBtn) roomsBtn.addEventListener('click', () => roomsShow(true));
+  if (roomsClose) roomsClose.addEventListener('click', () => {
+    roomsShow(false);
+    if (typeof SFX === 'object' && SFX) SFX.ui();
+  });
+  /* The wash around the card is a way out on a phone, where CLOSE sits at the
+     top of a tall panel and a thumb is already at the bottom. */
+  if (roomsPanel) roomsPanel.addEventListener('click', e => { if (e.target === roomsPanel) roomsShow(false); });
+  addEventListener('keydown', e => { if (e.code === 'Escape' && roomsIsOpen()) roomsShow(false); });
+  addEventListener('keydown', roomsTrapFocus);
+
+  const hold = document.getElementById('holdStart');
+  if (hold) hold.addEventListener('click', () => { SFX.ui(); netHoldStart(); });
+
+  const refresh = document.getElementById('refreshRooms');
+  if (refresh) refresh.addEventListener('click', () => netRefreshRooms(true));
+  netRefreshRooms(true);
+
+  /* An invite link is an instruction, not a suggestion. Dial it — the callsign
+     is either remembered or generated, and neither is worth a click. */
+  if (invited) {
+    netStatus('Joining ' + invited + '…');
+    netConnect('join', invited);
+  }
+  /* Poll only while the setup menu is actually on screen — netRefreshRooms
+     bails out on its own once the match starts or the pause card is up. */
+  NET.roomsTimer = setInterval(() => netRefreshRooms(false), 5000);
+
+  roomInput.addEventListener('input', () => {
+    roomInput.value = NETP.normalizeRoomCode(roomInput.value);
+  });
+  roomInput.addEventListener('keydown', e => {
+    if (e.key === 'Enter') netConnect('join', roomInput.value);
+  });
+  document.getElementById('netStart').addEventListener('click', netHostStart);
+  document.getElementById('netLeave').addEventListener('click', netLeaveLobby);
+  document.getElementById('copyRoom').addEventListener('click', async () => {
+    const u = new URL(location.href);
+    u.searchParams.set('room', NET.room);
+    u.searchParams.delete('autostart');
+    try {
+      await navigator.clipboard.writeText(u.toString());
+      netStatus('لینک دعوت کپی شد!');
+    } catch (e) {
+      netStatus('کد اتاق: ' + NET.room);
+    }
+  });
+}
